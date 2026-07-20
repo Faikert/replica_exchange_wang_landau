@@ -1,0 +1,9 @@
+# Example arguments for a quick, deliberately coarse validation run.
+# Pass these options to wl_run (the file is documentation, not a config parser input).
+--nx 2 --ny 2 --nz 2
+--emin -20 --emax 20 --bin-width 0.25
+--windows 1 --walkers 2
+--flatness 0.7 --min-visits 20 --final-factor 0.001
+--exchange-interval 1000 --max-attempts 2000000
+--seed 20260713 --output cubic_2x2x2
+

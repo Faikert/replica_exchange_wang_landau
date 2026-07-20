@@ -1,0 +1,13 @@
+/build*/
+/wl_output*
+/wl_smoke*
+/*.bin
+/*.tmp
+
+/articles*/
+*.csv
+*.ini
+*.json
+*.out
+!/examples/*.csv
+!/examples/*.ini
