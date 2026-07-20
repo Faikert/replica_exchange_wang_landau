@@ -11,3 +11,5 @@
 *.out
 !/examples/*.csv
 !/examples/*.ini
+start.sh
+Testing*/
