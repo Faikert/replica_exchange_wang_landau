@@ -17,6 +17,26 @@ struct DosFragment {
     std::vector<std::uint8_t> valid;
 };
 
+struct WindowSamplingStatistics {
+    EnergyWindow window;
+    std::vector<double> squared_energy_displacement;
+    std::vector<std::uint64_t> displacement_samples;
+    std::uint64_t round_trips{};
+    std::uint64_t walkers{};
+};
+
+struct AdaptiveWindowParameters {
+    bool enabled{false};
+    std::size_t iterations{2};
+    double pilot_mcs{10'000.0};
+    double smoothing_width{}; // energy units; zero selects an automatic physical width
+    double minimum_width{};   // energy units; zero selects one quarter of the mean core width
+    double diffusivity_floor_fraction{0.05};
+    double curvature_weight{0.25};
+    double round_trip_target{2.0};
+    double maximum_round_trip_penalty{3.0};
+};
+
 struct DensityOfStates {
     EnergyGrid grid;
     std::vector<double> log_g;
@@ -44,5 +64,9 @@ struct ThermodynamicPoint {
     double boltzmann_constant = 1.0);
 [[nodiscard]] DosFragment exact_enumeration(const Couplings& couplings, EnergyGrid grid,
                                             std::size_t max_spins = 26);
+[[nodiscard]] std::vector<EnergyWindow> adapt_energy_windows(
+    EnergyGrid grid, std::span<const DosFragment> fragments,
+    std::span<const WindowSamplingStatistics> sampling, std::size_t window_count,
+    double overlap, const AdaptiveWindowParameters& parameters);
 
 } // namespace wl

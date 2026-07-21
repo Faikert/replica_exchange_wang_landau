@@ -115,6 +115,16 @@ void apply_ini_setting(RunConfig& c,const std::string& section,const std::string
     else if(full=="parallel.windows") c.windows=number<std::size_t>(value,full);
     else if(full=="parallel.walkers"||full=="parallel.walkers_per_rank") c.walkers_per_rank=number<std::size_t>(value,full);
     else if(full=="parallel.overlap") c.overlap=number<double>(value,full);
+    else if(full=="adaptive_windows.enabled") c.adaptive_windows.enabled=boolean(value,full);
+    else if(full=="adaptive_windows.iterations") c.adaptive_windows.iterations=number<std::size_t>(value,full);
+    else if(full=="adaptive_windows.pilot_mcs") c.adaptive_windows.pilot_mcs=number<double>(value,full);
+    else if(full=="adaptive_windows.smoothing_width") c.adaptive_windows.smoothing_width=number<double>(value,full);
+    else if(full=="adaptive_windows.minimum_width") c.adaptive_windows.minimum_width=number<double>(value,full);
+    else if(full=="adaptive_windows.diffusivity_floor_fraction") c.adaptive_windows.diffusivity_floor_fraction=number<double>(value,full);
+    else if(full=="adaptive_windows.curvature_weight") c.adaptive_windows.curvature_weight=number<double>(value,full);
+    else if(full=="adaptive_windows.round_trip_target") c.adaptive_windows.round_trip_target=number<double>(value,full);
+    else if(full=="adaptive_windows.maximum_round_trip_penalty") c.adaptive_windows.maximum_round_trip_penalty=number<double>(value,full);
+    else if(full=="adaptive_windows.round_trip_margin_fraction") c.wl.round_trip_margin_fraction=number<double>(value,full);
     else if(full=="parallel.exchange_interval") { c.exchange_interval_attempts=number<std::uint64_t>(value,full); c.exchange_interval_uses_mcs=false; }
     else if(full=="parallel.exchange_interval_mcs") { c.exchange_interval_mcs=number<double>(value,full); c.exchange_interval_uses_mcs=true; }
     else if(full=="wl.flatness") c.wl.flatness=number<double>(value,full);
@@ -235,12 +245,40 @@ void RunConfig::validate(bool require_grid) const {
     if (!(spacing > 0.0) || !std::isfinite(progress_interval_seconds) ||
         progress_interval_seconds < 0.0 || windows == 0 || walkers_per_rank == 0 ||
         overlap < 0.0 || overlap >= 1.0 || exchange_interval_attempts == 0 ||
-        wl.check_interval_attempts == 0 || checkpoint_interval_attempts == 0)
+        wl.check_interval_attempts == 0 || checkpoint_interval_attempts == 0 ||
+        !std::isfinite(wl.round_trip_margin_fraction) ||
+        wl.round_trip_margin_fraction<0.0 || wl.round_trip_margin_fraction>=0.5)
         throw std::invalid_argument("Invalid run configuration");
     if (require_grid && !energy_grid_explicit)
         throw std::invalid_argument("Production runs require --emin, --emax, and --bin-width");
     grid.validate();
     if (windows > grid.bins()) throw std::invalid_argument("More windows than energy bins");
+    if(!explicit_windows.empty()) {
+        if(explicit_windows.size()!=windows || explicit_windows.front().begin!=0 ||
+           explicit_windows.back().end!=grid.bins())
+            throw std::invalid_argument("Explicit energy windows must match the configured range");
+        for(std::size_t i=0;i<explicit_windows.size();++i) {
+            const auto& window=explicit_windows[i];
+            if(window.begin>=window.end || window.end>grid.bins() ||
+               (i!=0 && (window.begin<=explicit_windows[i-1].begin ||
+                         window.begin>=explicit_windows[i-1].end)))
+                throw std::invalid_argument("Explicit energy windows must be ordered and overlap");
+        }
+    }
+    const auto& adaptive=adaptive_windows;
+    if(adaptive.enabled && (adaptive.iterations==0 || !(adaptive.pilot_mcs>0.0) ||
+       !std::isfinite(adaptive.pilot_mcs) || adaptive.smoothing_width<0.0 ||
+       !std::isfinite(adaptive.smoothing_width) || adaptive.minimum_width<0.0 ||
+       !std::isfinite(adaptive.minimum_width) ||
+       !(adaptive.diffusivity_floor_fraction>0.0) ||
+       !std::isfinite(adaptive.diffusivity_floor_fraction) ||
+       adaptive.curvature_weight<0.0 || !std::isfinite(adaptive.curvature_weight) ||
+       adaptive.round_trip_target<0.0 || !std::isfinite(adaptive.round_trip_target) ||
+       adaptive.maximum_round_trip_penalty<1.0 ||
+       !std::isfinite(adaptive.maximum_round_trip_penalty) ||
+       (adaptive.minimum_width>0.0 && adaptive.minimum_width*static_cast<double>(windows)>
+                                        grid.maximum-grid.minimum)))
+        throw std::invalid_argument("Invalid adaptive-window configuration");
 }
 
 RunConfig parse_arguments(int argc, char** argv) {
@@ -279,6 +317,16 @@ RunConfig parse_arguments(int argc, char** argv) {
         else if (key == "--windows") c.windows=number<std::size_t>(value(i,key),key);
         else if (key == "--walkers") c.walkers_per_rank=number<std::size_t>(value(i,key),key);
         else if (key == "--overlap") c.overlap=number<double>(value(i,key),key);
+        else if (key == "--adaptive-windows") c.adaptive_windows.enabled=boolean(value(i,key),key);
+        else if (key == "--adaptive-iterations") c.adaptive_windows.iterations=number<std::size_t>(value(i,key),key);
+        else if (key == "--adaptive-pilot-mcs") c.adaptive_windows.pilot_mcs=number<double>(value(i,key),key);
+        else if (key == "--adaptive-smoothing-width") c.adaptive_windows.smoothing_width=number<double>(value(i,key),key);
+        else if (key == "--adaptive-minimum-width") c.adaptive_windows.minimum_width=number<double>(value(i,key),key);
+        else if (key == "--adaptive-diffusivity-floor") c.adaptive_windows.diffusivity_floor_fraction=number<double>(value(i,key),key);
+        else if (key == "--adaptive-curvature-weight") c.adaptive_windows.curvature_weight=number<double>(value(i,key),key);
+        else if (key == "--adaptive-round-trip-target") c.adaptive_windows.round_trip_target=number<double>(value(i,key),key);
+        else if (key == "--adaptive-round-trip-penalty") c.adaptive_windows.maximum_round_trip_penalty=number<double>(value(i,key),key);
+        else if (key == "--adaptive-round-trip-margin") c.wl.round_trip_margin_fraction=number<double>(value(i,key),key);
         else if (key == "--seed") { c.seed=number<std::uint64_t>(value(i,key),key); c.seed_explicit=true; }
         else if (key == "--flatness") c.wl.flatness=number<double>(value(i,key),key);
         else if (key == "--min-visits") c.wl.minimum_visits=number<std::uint64_t>(value(i,key),key);
@@ -328,6 +376,10 @@ std::string usage(std::string_view program) {
       "  [--geometry file --box-x L --box-y L --box-z L] [--cutoff R]\n"
       "  [--config run.ini] (CLI options override INI values)\n"
       "  [--windows N --walkers N --overlap 0.75] [--seed N]\n"
+      "  [--adaptive-windows true|false --adaptive-iterations N --adaptive-pilot-mcs MCS]\n"
+      "  [--adaptive-smoothing-width dE --adaptive-minimum-width dE]\n"
+      "  [--adaptive-diffusivity-floor F --adaptive-curvature-weight W]\n"
+      "  [--adaptive-round-trip-target R --adaptive-round-trip-penalty P]\n"
       "  [--flatness 0.8 --min-visits 100 --final-factor 1e-8 --inverse-time true|false]\n"
       "  [--initialization-max-attempts N --initialization-target-fraction 0.5]\n"
       "  [--initialization-temperature-fraction 0.05]\n"
@@ -379,7 +431,7 @@ void write_workers_stat_csv(const std::string& path,
     if(spin_count==0) throw std::invalid_argument("Cannot write MCS statistics for zero spins");
     std::ofstream out(path); if (!out) throw std::runtime_error("Cannot write " + path);
     out << "mpi_rank,window,walker_id,attempted_flips,attempted_mcs,accepted,forced_accepted,accepted_percent,"
-           "attempts_since_last_accepted,mcs_since_last_accepted,energy,factor,active_bins,min_h,mean_h,min_over_mean\n"
+           "attempts_since_last_accepted,mcs_since_last_accepted,energy,factor,active_bins,min_h,mean_h,min_over_mean,round_trips\n"
         << std::setprecision(17);
     for (const auto& walker : statistics) {
         const auto percent = walker.attempted == 0 ? 0.0 :
@@ -394,7 +446,7 @@ void write_workers_stat_csv(const std::string& path,
             << walker.energy << ','
             << walker.factor << ',' << walker.active_bins << ','
             << walker.minimum_histogram << ',' << walker.mean_histogram << ','
-            << walker.min_over_mean << '\n';
+            << walker.min_over_mean << ',' << walker.round_trips << '\n';
     }
 }
 
@@ -405,7 +457,7 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
                          bool converged, int mpi_size, int omp_threads) {
     std::ofstream out(path); if (!out) throw std::runtime_error("Cannot write " + path);
     out << std::setprecision(17)
-        << "{\n  \"format_version\": 3,\n  \"config_file\": \""<<json_escape(c.config_file)<<"\",\n"
+        << "{\n  \"format_version\": 4,\n  \"config_file\": \""<<json_escape(c.config_file)<<"\",\n"
         << "  \"geometry_file\": \""<<json_escape(c.geometry_file)<<"\",\n"
         << "  \"physics\": {\"model\": \"dipolar_ising\", "
         << "\"spins\": "<<couplings.size()<<", \"coupling_scale\": "<<c.coupling_scale<<", \"periodic\": "<<(c.periodic?"true":"false")
@@ -428,6 +480,25 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         << ", \"force_accept_after_mcs\": "<<c.force_accept_after_mcs
         << ", \"inverse_time_enabled\": "<<(c.wl.inverse_time_enabled?"true":"false")
         << ", \"force_accept_after_attempts\": "<<c.wl.force_accept_after_attempts<<"},\n"
+        << "  \"adaptive_windows\": {\"enabled\": "<<(c.adaptive_windows.enabled?"true":"false")
+        << ", \"iterations\": "<<c.adaptive_windows.iterations
+        << ", \"pilot_mcs\": "<<c.adaptive_windows.pilot_mcs
+        << ", \"smoothing_width\": "<<c.adaptive_windows.smoothing_width
+        << ", \"minimum_width\": "<<c.adaptive_windows.minimum_width
+        << ", \"diffusivity_floor_fraction\": "<<c.adaptive_windows.diffusivity_floor_fraction
+        << ", \"curvature_weight\": "<<c.adaptive_windows.curvature_weight
+        << ", \"round_trip_target\": "<<c.adaptive_windows.round_trip_target
+        << ", \"maximum_round_trip_penalty\": "<<c.adaptive_windows.maximum_round_trip_penalty
+        << ", \"round_trip_margin_fraction\": "<<c.wl.round_trip_margin_fraction
+        << ", \"energy_ranges\": [";
+    const auto metadata_windows=c.explicit_windows.empty()?
+        partition_windows(c.grid.bins(),c.windows,c.overlap):c.explicit_windows;
+    for(std::size_t i=0;i<metadata_windows.size();++i) {
+        if(i!=0) out<<", ";
+        out<<'['<<c.grid.minimum+static_cast<double>(metadata_windows[i].begin)*c.grid.width
+           <<", "<<c.grid.minimum+static_cast<double>(metadata_windows[i].end)*c.grid.width<<']';
+    }
+    out << "]},\n"
         << "  \"initialization\": {\"method\": \"adaptive_target_metropolis\""
         << ", \"max_attempts\": "<<c.wl.initialization_max_attempts
         << ", \"target_fraction\": "<<c.wl.initialization_target_fraction

@@ -24,6 +24,8 @@ struct RunConfig {
     std::size_t windows{1};
     std::size_t walkers_per_rank{1};
     double overlap{0.75};
+    std::vector<EnergyWindow> explicit_windows;
+    AdaptiveWindowParameters adaptive_windows;
     std::uint64_t seed{1};
     bool seed_explicit{false};
     WlParameters wl;
@@ -68,6 +70,7 @@ struct WalkerStatistics {
     std::uint64_t minimum_histogram{};
     double mean_histogram{};
     double min_over_mean{};
+    std::uint64_t round_trips{};
 };
 
 [[nodiscard]] RunConfig parse_arguments(int argc, char** argv);

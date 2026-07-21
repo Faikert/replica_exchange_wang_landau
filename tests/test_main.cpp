@@ -43,6 +43,9 @@ void test_csv_geometry_and_ini() {
     { std::ofstream out(ini); out<<"[geometry]\nfile=system.csv\nperiodic=false\n"
         <<"[energy]\nminimum=-4\nmaximum=4\nbin_width=0.25\n"
         <<"[parallel]\nexchange_interval_mcs=1.5\n"
+        <<"[adaptive_windows]\nenabled=true\niterations=3\npilot_mcs=12\nsmoothing_width=0.75\n"
+        <<"minimum_width=1.25\ndiffusivity_floor_fraction=0.08\ncurvature_weight=0.4\n"
+        <<"round_trip_target=3\nmaximum_round_trip_penalty=2.5\nround_trip_margin_fraction=0.15\n"
         <<"[wl]\ncheck_interval_mcs=2.5\nforce_accept_after_mcs=3.5\ninverse_time=false\n"
         <<"[initialization]\nmax_attempts=123\ntarget_fraction=0.4\ntemperature_fraction=0.07\n"
         <<"stall_attempts_per_spin=17\ntemperature_multiplier=3\nmax_temperature_fraction=0.4\n"
@@ -76,6 +79,19 @@ void test_csv_geometry_and_ini() {
          "INI initialization temperature multiplier");
     near(config.wl.initialization_max_temperature_fraction,0.4,1e-14,
          "INI initialization maximum temperature");
+    require(config.adaptive_windows.enabled&&config.adaptive_windows.iterations==3,
+            "INI adaptive-window switch and iterations");
+    near(config.adaptive_windows.pilot_mcs,12.0,1e-14,"INI adaptive pilot length");
+    near(config.adaptive_windows.smoothing_width,0.75,1e-14,"INI adaptive smoothing energy");
+    near(config.adaptive_windows.minimum_width,1.25,1e-14,"INI adaptive minimum energy width");
+    near(config.adaptive_windows.diffusivity_floor_fraction,0.08,1e-14,
+         "INI adaptive diffusivity floor");
+    near(config.adaptive_windows.curvature_weight,0.4,1e-14,"INI adaptive curvature weight");
+    near(config.adaptive_windows.round_trip_target,3.0,1e-14,"INI adaptive round-trip target");
+    near(config.adaptive_windows.maximum_round_trip_penalty,2.5,1e-14,
+         "INI adaptive round-trip penalty");
+    near(config.wl.round_trip_margin_fraction,0.15,1e-14,
+         "INI adaptive round-trip margin");
     std::vector<std::string> progress_arguments{"test","--progress","3","--inverse-time","true"};
     std::vector<char*> progress_argv; for(auto& argument:progress_arguments) progress_argv.push_back(argument.data());
     const auto progress=wl::parse_arguments(static_cast<int>(progress_argv.size()),progress_argv.data());
@@ -312,9 +328,9 @@ void test_unlimited_max_attempts() {
     std::string row;
     std::getline(stat_file,header);
     std::getline(stat_file,row);
-    require(header=="mpi_rank,window,walker_id,attempted_flips,attempted_mcs,accepted,forced_accepted,accepted_percent,attempts_since_last_accepted,mcs_since_last_accepted,energy,factor,active_bins,min_h,mean_h,min_over_mean",
+    require(header=="mpi_rank,window,walker_id,attempted_flips,attempted_mcs,accepted,forced_accepted,accepted_percent,attempts_since_last_accepted,mcs_since_last_accepted,energy,factor,active_bins,min_h,mean_h,min_over_mean,round_trips",
             "walker statistics CSV header");
-    require(row=="0,0,0,5,2.5,0,0,0,5,2.5,1,1,1,6,6,1","walker statistics CSV row");
+    require(row=="0,0,0,5,2.5,0,0,0,5,2.5,1,1,1,6,6,1,0","walker statistics CSV row");
     stat_file.close();
     std::filesystem::remove(stat_path);
 
@@ -372,6 +388,87 @@ void test_exact_enumeration_and_thermo() {
     const auto relative=wl::stitch_dos(grid,std::span(&incomplete,1),false,geometry.size());
     require(relative.valid[0]==0&&std::isfinite(wl::thermodynamics(relative,temperatures)[0].heat_capacity),
             "relative thermodynamics ignores invalid bins");
+}
+
+void test_adaptive_energy_windows() {
+    wl::EnergyGrid grid{-10.0,10.0,0.5};
+    const auto initial=wl::partition_windows(grid.bins(),4,0.5);
+    std::vector<wl::DosFragment> fragments;
+    std::vector<wl::WindowSamplingStatistics> sampling;
+    for(const auto window:initial) {
+        wl::DosFragment fragment{window,std::vector<double>(grid.bins(),0.0),
+            std::vector<std::uint64_t>(grid.bins(),0),std::vector<double>(grid.bins(),0.0),
+            std::vector<std::uint8_t>(grid.bins(),0)};
+        wl::WindowSamplingStatistics statistics{window,std::vector<double>(grid.bins(),0.0),
+            std::vector<std::uint64_t>(grid.bins(),0),0,1};
+        for(std::size_t i=window.begin;i<window.end;++i) {
+            fragment.valid[i]=1;
+            statistics.displacement_samples[i]=100;
+            const auto diffusivity=grid.center(i)<-5.0?0.01:1.0;
+            statistics.squared_energy_displacement[i]=100.0*diffusivity;
+        }
+        fragments.push_back(std::move(fragment));
+        sampling.push_back(std::move(statistics));
+    }
+    wl::AdaptiveWindowParameters parameters;
+    parameters.smoothing_width=0.5;
+    parameters.minimum_width=1.0;
+    parameters.curvature_weight=0.0;
+    parameters.round_trip_target=0.0;
+    const auto adapted=wl::adapt_energy_windows(grid,fragments,sampling,4,0.5,parameters);
+    require(adapted.size()==4&&adapted.front().begin==0&&adapted.back().end==grid.bins(),
+            "adaptive windows cover the energy range");
+    for(std::size_t i=1;i<adapted.size();++i)
+        require(adapted[i].begin<adapted[i-1].end&&adapted[i].begin>adapted[i-1].begin,
+                "adaptive windows remain ordered and overlapping");
+    const auto first_width=static_cast<double>(adapted.front().end-adapted.front().begin)*grid.width;
+    const auto last_width=static_cast<double>(adapted.back().end-adapted.back().begin)*grid.width;
+    require(first_width<last_width,"low diffusivity must produce a narrower energy window");
+
+    wl::EnergyGrid fine_grid{-10.0,10.0,0.25};
+    const auto fine_initial=wl::partition_windows(fine_grid.bins(),4,0.5);
+    std::vector<wl::DosFragment> fine_fragments;
+    std::vector<wl::WindowSamplingStatistics> fine_sampling;
+    for(const auto window:fine_initial) {
+        wl::DosFragment fragment{window,std::vector<double>(fine_grid.bins(),0.0),
+            std::vector<std::uint64_t>(fine_grid.bins(),0),
+            std::vector<double>(fine_grid.bins(),0.0),
+            std::vector<std::uint8_t>(fine_grid.bins(),0)};
+        wl::WindowSamplingStatistics statistics{window,
+            std::vector<double>(fine_grid.bins(),0.0),
+            std::vector<std::uint64_t>(fine_grid.bins(),0),0,1};
+        for(std::size_t i=window.begin;i<window.end;++i) {
+            fragment.valid[i]=1;
+            statistics.displacement_samples[i]=100;
+            statistics.squared_energy_displacement[i]=
+                100.0*(fine_grid.center(i)<-5.0?0.01:1.0);
+        }
+        fine_fragments.push_back(std::move(fragment));
+        fine_sampling.push_back(std::move(statistics));
+    }
+    const auto fine_adapted=wl::adapt_energy_windows(
+        fine_grid,fine_fragments,fine_sampling,4,0.5,parameters);
+    const auto coarse_first_upper=grid.minimum+static_cast<double>(adapted.front().end)*grid.width;
+    const auto fine_first_upper=fine_grid.minimum+
+        static_cast<double>(fine_adapted.front().end)*fine_grid.width;
+    require(std::abs(coarse_first_upper-fine_first_upper)<=grid.width,
+            "adaptive boundaries are stable under energy-grid refinement");
+
+    auto couplings=std::make_shared<wl::DenseCouplings>(
+        wl::Geometry::simple_cubic(2,1,1,1.0,{0,0,1},false),1.0);
+    wl::WlParameters walker_parameters{0.1,1,0.01,10};
+    walker_parameters.collect_window_statistics=true;
+    walker_parameters.round_trip_margin_fraction=0.1;
+    wl::EnergyGrid walker_grid{-1.25,1.25,0.25};
+    wl::WangLandauWalker walker(91,couplings,walker_grid,{0,walker_grid.bins()},
+                                walker_parameters,123,{1,1});
+    walker.run_attempts(5'000);
+    const auto recorded=std::accumulate(walker.displacement_samples().begin(),
+        walker.displacement_samples().end(),std::uint64_t{0});
+    const auto motion=std::accumulate(walker.squared_energy_displacement().begin(),
+        walker.squared_energy_displacement().end(),0.0);
+    require(recorded==5'000&&motion>0.0,"energy diffusivity statistics are collected");
+    require(walker.round_trips()>0,"complete low-high-low energy trips are counted");
 }
 
 void test_histogram_statistics() {
@@ -522,7 +619,8 @@ int main() {
       {"histogram_statistics",test_histogram_statistics},
       {"classic_rewl_independence_summary",test_classic_rewl_independence_and_summary},
       {"unlimited_max_attempts",test_unlimited_max_attempts},
-      {"exact_thermo",test_exact_enumeration_and_thermo}};
+      {"exact_thermo",test_exact_enumeration_and_thermo},
+      {"adaptive_energy_windows",test_adaptive_energy_windows}};
     int failed=0;
     for(const auto& [name,test]:tests) try { test(); std::cout<<"PASS "<<name<<'\n'; }
       catch(const std::exception& e) { ++failed; std::cerr<<"FAIL "<<name<<": "<<e.what()<<'\n'; }

@@ -56,7 +56,33 @@ build/Release/wl_run.exe --nx 2 --ny 2 --nz 2 `
 
 For MPI, the number of ranks must be a multiple of `--windows`. Each rank owns `--walkers` OpenMP walkers. Ranks belonging to one window use an MPI subcommunicator for DOS averaging; corresponding ranks in adjacent windows exchange replicas using an even/odd schedule. MPI calls are made by the master thread under `MPI_THREAD_FUNNELED`.
 
-The program writes per-window CSV files, a stitched DOS with a within-run standard error across walkers, thermodynamic observables, and JSON metadata including exchange and forced acceptance. Each DOS CSV has a `valid` column; only bins visited by every walker in the corresponding window contribute to the combined DOS. A one-walker run reports `standard_error=nan`. This uncertainty describes dispersion inside one REWL run and does not replace an ensemble of independent master seeds. If a run stops with `converged=no`, it also writes `${output_prefix}_workers_stat.csv` with each walker's attempted flips and MCS, flip acceptance, forced-acceptance count, age of the last accepted flip in both units, final energy, modification factor, active-bin count, and `min(H)/mean(H)` diagnostics. A checkpoint is supported for a single-window/single-walker run using `--checkpoint path`; its RNG state and forced-acceptance count are included.
+### Adaptive energy windows
+
+Set `[adaptive_windows] enabled = true` or pass `--adaptive-windows true` to optimize window boundaries before production. Each pilot records the accepted squared energy displacement at the proposal energy, complete low-high-low trips through the interior of each window, and the local curvature of `log_g(E)`. The optimizer constructs the continuous difficulty density
+
+```
+w(E) = round_trip_penalty(E) * [1 + curvature_weight*C(E)] / sqrt(max(D(E), D_floor))
+```
+
+and places equal difficulty mass in every core energy interval. Low-diffusivity or high-curvature regions therefore receive narrower windows. Overlaps are added afterward using the configured fractional `parallel.overlap`. `smoothing_width` and `minimum_width` are physical energy differences and are independent of the DOS grid resolution; zero selects automatic values from the full energy span. After every pilot, all pilot `log_g` and histogram data are discarded. Production starts from fresh walkers with fixed adapted boundaries, so adaptation does not enter the production DOS estimator.
+
+```ini
+[adaptive_windows]
+enabled = true
+iterations = 2
+pilot_mcs = 10000
+smoothing_width = 5.0
+minimum_width = 40.0
+diffusivity_floor_fraction = 0.05
+curvature_weight = 0.25
+round_trip_target = 2
+maximum_round_trip_penalty = 3
+round_trip_margin_fraction = 0.1
+```
+
+If `smoothing_width` or `minimum_width` is zero, the automatic choice is recorded as zero in the configuration metadata while the final continuous energy ranges are recorded explicitly. A pilot should be long enough for ordinary windows to complete several trips. Windows with no completed trip receive the maximum configured difficulty penalty. Adaptation is deterministic for a fixed master seed.
+
+The program writes per-window CSV files, a stitched DOS with a within-run standard error across walkers, thermodynamic observables, and JSON metadata including exchange and forced acceptance. Each DOS CSV has a `valid` column; only bins visited by every walker in the corresponding window contribute to the combined DOS. A one-walker run reports `standard_error=nan`. This uncertainty describes dispersion inside one REWL run and does not replace an ensemble of independent master seeds. If a run stops with `converged=no`, it also writes `${output_prefix}_workers_stat.csv` with each walker's attempted flips and MCS, flip acceptance, forced-acceptance count, age of the last accepted flip in both units, final energy, modification factor, active-bin count, `min(H)/mean(H)`, and completed energy round trips. A checkpoint is supported for a single-window/single-walker run using `--checkpoint path`; its RNG state and forced-acceptance count are included.
 
 Use exact enumeration for small validation systems:
 

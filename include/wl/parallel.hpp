@@ -13,6 +13,7 @@ public:
     [[nodiscard]] int rank() const noexcept { return rank_; }
     [[nodiscard]] int size() const noexcept { return size_; }
     [[nodiscard]] std::uint64_t broadcast_seed(std::uint64_t seed) const;
+    void broadcast_windows(std::vector<EnergyWindow>& windows) const;
     [[nodiscard]] bool mpi_enabled() const noexcept { return mpi_enabled_; }
 private:
     int rank_{0}; int size_{1}; bool mpi_enabled_{false}; bool owns_mpi_{false};
@@ -20,12 +21,14 @@ private:
 struct RewlResult {
     std::vector<DosFragment> fragments;
     std::vector<WalkerStatistics> walker_statistics;
+    std::vector<WindowSamplingStatistics> sampling_statistics;
     std::uint64_t attempted{}, accepted{}, forced_accepted{};
     std::uint64_t exchange_attempted{}, exchange_accepted{};
     bool converged{false};
 };
 [[nodiscard]] DosFragment summarize_walkers(
-    EnergyWindow window,std::span<const WangLandauWalker* const> walkers,std::size_t bins);
+    EnergyWindow window,std::span<const WangLandauWalker* const> walkers,std::size_t bins,
+    bool allow_empty_intersection=false);
 [[nodiscard]] RewlResult run_rewl(const ParallelContext&, std::shared_ptr<const Couplings>,
                                   const RunConfig&);
 [[nodiscard]] int maximum_openmp_threads() noexcept;

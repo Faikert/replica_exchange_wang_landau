@@ -50,6 +50,8 @@ struct WlParameters {
     std::uint64_t initialization_stall_attempts_per_spin{1'000};
     double initialization_temperature_multiplier{2.0};
     double initialization_max_temperature_fraction{0.5};
+    bool collect_window_statistics{false};
+    double round_trip_margin_fraction{0.1};
 };
 
 enum class RefinementStage : std::uint8_t { wang_landau, inverse_time, frozen };
@@ -104,6 +106,13 @@ public:
     [[nodiscard]] const std::vector<double>& log_g() const noexcept { return log_g_; }
     [[nodiscard]] const std::vector<std::uint64_t>& histogram() const noexcept { return histogram_; }
     [[nodiscard]] const std::vector<std::uint8_t>& active_mask() const noexcept { return active_; }
+    [[nodiscard]] const std::vector<double>& squared_energy_displacement() const noexcept {
+        return squared_energy_displacement_;
+    }
+    [[nodiscard]] const std::vector<std::uint64_t>& displacement_samples() const noexcept {
+        return displacement_samples_;
+    }
+    [[nodiscard]] std::uint64_t round_trips() const noexcept { return round_trips_; }
     [[nodiscard]] std::uint64_t attempted() const noexcept { return attempted_; }
     [[nodiscard]] std::uint64_t accepted() const noexcept { return accepted_; }
     [[nodiscard]] std::uint64_t forced_accepted() const noexcept { return forced_accepted_; }
@@ -129,6 +138,8 @@ private:
     std::vector<double> log_g_;
     std::vector<std::uint64_t> histogram_;
     std::vector<std::uint8_t> active_;
+    std::vector<double> squared_energy_displacement_;
+    std::vector<std::uint64_t> displacement_samples_;
     std::size_t active_bin_count_{};
     double factor_{1.0};
     std::uint64_t attempted_{};
@@ -136,10 +147,13 @@ private:
     std::uint64_t forced_accepted_{};
     std::uint64_t last_accepted_attempt_{};
     RefinementStage stage_{RefinementStage::wang_landau};
+    std::uint8_t round_trip_state_{};
+    std::uint64_t round_trips_{};
 
     void update_current_bin();
     [[nodiscard]] std::size_t active_bins() const noexcept;
     void update_inverse_time_factor();
+    void update_round_trip_state() noexcept;
 };
 
 } // namespace wl

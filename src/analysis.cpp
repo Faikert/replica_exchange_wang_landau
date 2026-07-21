@@ -180,4 +180,162 @@ DosFragment exact_enumeration(const Couplings& couplings, EnergyGrid grid,
             std::vector<double>(grid.bins(), 0.0),std::move(valid)};
 }
 
+std::vector<EnergyWindow> adapt_energy_windows(
+    EnergyGrid grid, std::span<const DosFragment> fragments,
+    std::span<const WindowSamplingStatistics> sampling, std::size_t window_count,
+    double overlap, const AdaptiveWindowParameters& p) {
+    grid.validate();
+    const auto bins=grid.bins();
+    if(window_count==0 || window_count>bins || fragments.size()!=window_count ||
+       sampling.size()!=window_count || overlap<0.0 || overlap>=1.0 ||
+       !std::isfinite(p.diffusivity_floor_fraction) ||
+       !(p.diffusivity_floor_fraction>0.0) ||
+       !std::isfinite(p.curvature_weight) || p.curvature_weight<0.0 ||
+       !std::isfinite(p.round_trip_target) || p.round_trip_target<0.0 ||
+       !std::isfinite(p.maximum_round_trip_penalty) ||
+       p.maximum_round_trip_penalty<1.0 || !std::isfinite(p.smoothing_width) ||
+       p.smoothing_width<0.0 || !std::isfinite(p.minimum_width) || p.minimum_width<0.0)
+        throw std::invalid_argument("Invalid adaptive-window parameters");
+    if(window_count==1) return {{0,bins}};
+
+    std::vector<double> displacement_sum(bins,0.0),curvature_sum(bins,0.0);
+    std::vector<std::uint64_t> samples(bins,0),curvature_samples(bins,0);
+    std::vector<double> round_trip_penalty(bins,1.0);
+    const auto automatic_smoothing=(grid.maximum-grid.minimum)/
+        (10.0*static_cast<double>(window_count));
+    const auto smoothing=std::max(grid.width,p.smoothing_width>0.0?
+        p.smoothing_width:automatic_smoothing);
+    const auto radius=std::max<std::size_t>(1,static_cast<std::size_t>(
+        std::llround(smoothing/grid.width)));
+
+    for(std::size_t w=0;w<window_count;++w) {
+        const auto& stats=sampling[w];
+        const auto& fragment=fragments[w];
+        if(stats.window.begin!=fragment.window.begin || stats.window.end!=fragment.window.end ||
+           stats.squared_energy_displacement.size()!=bins ||
+           stats.displacement_samples.size()!=bins || fragment.log_g.size()!=bins ||
+           fragment.valid.size()!=bins)
+            throw std::invalid_argument("Adaptive-window pilot fragments are incompatible");
+        for(std::size_t i=stats.window.begin;i<stats.window.end;++i) {
+            displacement_sum[i]+=stats.squared_energy_displacement[i];
+            samples[i]+=stats.displacement_samples[i];
+        }
+        const auto expected=p.round_trip_target*static_cast<double>(stats.walkers);
+        const auto observed=static_cast<double>(stats.round_trips);
+        const auto penalty=expected<=0.0?1.0:std::min(p.maximum_round_trip_penalty,
+            std::sqrt(expected/std::max(1.0,observed)));
+        for(std::size_t i=stats.window.begin;i<stats.window.end;++i)
+            round_trip_penalty[i]=std::max(round_trip_penalty[i],penalty);
+
+        for(std::size_t i=fragment.window.begin+radius;
+            i+radius<fragment.window.end;++i) {
+            if(fragment.valid[i-radius]==0 || fragment.valid[i]==0 ||
+               fragment.valid[i+radius]==0) continue;
+            const auto scale=static_cast<double>(radius)*grid.width;
+            const auto curvature=std::abs(fragment.log_g[i+radius]-2.0*fragment.log_g[i]+
+                                          fragment.log_g[i-radius])/(scale*scale);
+            if(std::isfinite(curvature)) {
+                curvature_sum[i]+=curvature;
+                ++curvature_samples[i];
+            }
+        }
+    }
+
+    std::vector<long double> prefix_displacement(bins+1,0.0L);
+    std::vector<std::uint64_t> prefix_samples(bins+1,0);
+    for(std::size_t i=0;i<bins;++i) {
+        prefix_displacement[i+1]=prefix_displacement[i]+displacement_sum[i];
+        prefix_samples[i+1]=prefix_samples[i]+samples[i];
+    }
+    std::vector<double> diffusivity(bins,0.0),positive_diffusivity;
+    positive_diffusivity.reserve(bins);
+    for(std::size_t i=0;i<bins;++i) {
+        const auto lo=i>radius?i-radius:0;
+        const auto hi=std::min(bins,i+radius+1);
+        const auto count=prefix_samples[hi]-prefix_samples[lo];
+        if(count!=0) diffusivity[i]=static_cast<double>(
+            (prefix_displacement[hi]-prefix_displacement[lo])/static_cast<long double>(count));
+        if(diffusivity[i]>0.0&&std::isfinite(diffusivity[i]))
+            positive_diffusivity.push_back(diffusivity[i]);
+    }
+    double typical_diffusivity=1.0;
+    if(!positive_diffusivity.empty()) {
+        const auto middle=positive_diffusivity.begin()+
+            static_cast<std::ptrdiff_t>(positive_diffusivity.size()/2);
+        std::nth_element(positive_diffusivity.begin(),middle,positive_diffusivity.end());
+        typical_diffusivity=*middle;
+    }
+    const auto diffusivity_floor=std::max(std::numeric_limits<double>::min(),
+        p.diffusivity_floor_fraction*typical_diffusivity);
+
+    std::vector<double> curvature;
+    curvature.reserve(bins);
+    for(std::size_t i=0;i<bins;++i) if(curvature_samples[i]!=0) {
+        curvature_sum[i]/=static_cast<double>(curvature_samples[i]);
+        if(curvature_sum[i]>0.0&&std::isfinite(curvature_sum[i]))
+            curvature.push_back(curvature_sum[i]);
+    }
+    double curvature_scale=1.0;
+    if(!curvature.empty()) {
+        const auto position=std::min(curvature.size()-1,
+            static_cast<std::size_t>(0.9*static_cast<double>(curvature.size())));
+        const auto percentile=curvature.begin()+static_cast<std::ptrdiff_t>(position);
+        std::nth_element(curvature.begin(),percentile,curvature.end());
+        curvature_scale=std::max(*percentile,std::numeric_limits<double>::min());
+    }
+
+    std::vector<long double> cumulative_weight(bins+1,0.0L);
+    for(std::size_t i=0;i<bins;++i) {
+        const auto normalized_curvature=std::min(1.0,curvature_sum[i]/curvature_scale);
+        const auto weight=round_trip_penalty[i]*
+            (1.0+p.curvature_weight*normalized_curvature)/
+            std::sqrt(std::max(diffusivity[i],diffusivity_floor));
+        cumulative_weight[i+1]=cumulative_weight[i]+
+            static_cast<long double>(weight*grid.width);
+    }
+    const auto total_weight=cumulative_weight.back();
+    if(!(total_weight>0.0L)) throw std::runtime_error("Adaptive-window weight is empty");
+
+    const auto energy_span=grid.maximum-grid.minimum;
+    const auto minimum_width=p.minimum_width>0.0?p.minimum_width:
+        energy_span/(4.0*static_cast<double>(window_count));
+    if(!(minimum_width>0.0) || minimum_width*static_cast<double>(window_count)>energy_span)
+        throw std::invalid_argument("Adaptive minimum window width is too large");
+    const auto minimum_cells=std::max<std::size_t>(1,static_cast<std::size_t>(
+        std::ceil(minimum_width/grid.width)));
+
+    std::vector<std::size_t> core(window_count+1,0);
+    core.back()=bins;
+    for(std::size_t k=1;k<window_count;++k) {
+        const auto target=total_weight*static_cast<long double>(k)/
+                          static_cast<long double>(window_count);
+        auto candidate=static_cast<std::size_t>(std::lower_bound(
+            cumulative_weight.begin(),cumulative_weight.end(),target)-cumulative_weight.begin());
+        const auto lowest=core[k-1]+minimum_cells;
+        const auto highest=bins-(window_count-k)*minimum_cells;
+        candidate=std::clamp(candidate,lowest,highest);
+        core[k]=candidate;
+    }
+
+    const auto extension=overlap==0.0?0.0:overlap/(2.0*(1.0-overlap));
+    std::vector<EnergyWindow> result;
+    result.reserve(window_count);
+    for(std::size_t k=0;k<window_count;++k) {
+        const auto core_width=core[k+1]-core[k];
+        const auto extra=static_cast<std::size_t>(std::ceil(extension*
+            static_cast<double>(core_width)));
+        const auto begin=k==0?std::size_t{0}:(core[k]>extra?core[k]-extra:0);
+        const auto end=k+1==window_count?bins:
+            std::min(bins-(window_count-1-k),core[k+1]+extra);
+        result.push_back({begin,end});
+    }
+    for(std::size_t k=1;k<result.size();++k) {
+        result[k].begin=std::max(result[k].begin,result[k-1].begin+1);
+        result[k].end=std::max(result[k].end,result[k-1].end+1);
+        if(result[k].begin>=result[k-1].end || result[k].begin>=result[k].end)
+            throw std::runtime_error("Adaptive energy windows do not overlap");
+    }
+    return result;
+}
+
 } // namespace wl

@@ -83,7 +83,10 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
         !(parameters_.initialization_temperature_multiplier > 1.0) ||
         !std::isfinite(parameters_.initialization_max_temperature_fraction) ||
         parameters_.initialization_max_temperature_fraction <
-            parameters_.initialization_temperature_fraction)
+            parameters_.initialization_temperature_fraction ||
+        !std::isfinite(parameters_.round_trip_margin_fraction) ||
+        parameters_.round_trip_margin_fraction < 0.0 ||
+        parameters_.round_trip_margin_fraction >= 0.5)
         throw std::invalid_argument("Invalid WL parameters");
     const bool supplied_initial_configuration=!initial_spins.empty();
     if (!supplied_initial_configuration) initial_spins.assign(couplings_->size(), 1);
@@ -97,6 +100,10 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
     log_g_.assign(grid_.bins(), 0.0);
     histogram_.assign(grid_.bins(), 0);
     active_.assign(grid_.bins(), 0);
+    if(parameters_.collect_window_statistics) {
+        squared_energy_displacement_.assign(grid_.bins(),0.0);
+        displacement_samples_.assign(grid_.bins(),0);
+    }
 
     // An explicitly supplied in-window configuration is authoritative. Otherwise sample
     // pi(E) proportional to exp(-abs(E-E_target)/T_search). Raise T_search after stalls
@@ -104,6 +111,7 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
     const auto initial_bin=grid_.index(energy_);
     if(supplied_initial_configuration && initial_bin && window_.contains(*initial_bin)) {
         update_current_bin();
+        update_round_trip_state();
         return;
     }
     const auto lower=grid_.minimum+static_cast<double>(window_.begin)*grid_.width;
@@ -147,7 +155,9 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
                std::abs(candidate-target)<=target_half_width;
     };
     for (std::uint64_t step = 0; step < parameters_.initialization_max_attempts; ++step) {
-        if (inside_target_band(energy_)) { update_current_bin(); return; }
+        if (inside_target_band(energy_)) {
+            update_current_bin(); update_round_trip_state(); return;
+        }
         if(attempts_since_improvement>=stall_attempts) {
             if(search_temperature<maximum_search_temperature) {
                 search_temperature=std::min(
@@ -165,7 +175,9 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
                 ++random_restarts;
             }
             attempts_since_improvement=0;
-            if(inside_target_band(energy_)) { update_current_bin(); return; }
+            if(inside_target_band(energy_)) {
+                update_current_bin(); update_round_trip_state(); return;
+            }
         }
         const auto i = static_cast<std::size_t>(rng_.bounded(spins_.size()));
         const auto old = spins_[i];
@@ -185,7 +197,9 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
         else if(attempts_since_improvement<maximum_attempt_count)
             ++attempts_since_improvement;
     }
-    if (inside_target_band(energy_)) { update_current_bin(); return; }
+    if (inside_target_band(energy_)) {
+        update_current_bin(); update_round_trip_state(); return;
+    }
     std::ostringstream message;
     message<<std::setprecision(17)
            <<"Target Metropolis initialization did not reach target band ["
@@ -237,8 +251,14 @@ bool WangLandauWalker::attempt_flip() {
         if (forced) ++forced_accepted_;
         last_accepted_attempt_ = attempted_;
     }
+    if(parameters_.collect_window_statistics) {
+        const auto displacement=accepted?delta:0.0;
+        squared_energy_displacement_[*old_bin]+=displacement*displacement;
+        ++displacement_samples_[*old_bin];
+    }
     update_inverse_time_factor();
     update_current_bin();
+    update_round_trip_state();
     return accepted;
 }
 
@@ -267,6 +287,21 @@ void WangLandauWalker::update_inverse_time_factor() {
     if (count != 0 && attempted_ != 0)
         factor_ = static_cast<double>(count) / static_cast<double>(attempted_);
     if (factor_ <= parameters_.final_factor) stage_ = RefinementStage::frozen;
+}
+
+void WangLandauWalker::update_round_trip_state() noexcept {
+    if(!parameters_.collect_window_statistics) return;
+    const auto lower=grid_.minimum+static_cast<double>(window_.begin)*grid_.width;
+    const auto upper=grid_.minimum+static_cast<double>(window_.end)*grid_.width;
+    const auto margin=parameters_.round_trip_margin_fraction*(upper-lower);
+    if(energy_<=lower+margin) {
+        if(round_trip_state_==2) {
+            ++round_trips_;
+            round_trip_state_=1;
+        } else if(round_trip_state_==0) round_trip_state_=1;
+    } else if(energy_>=upper-margin && round_trip_state_==1) {
+        round_trip_state_=2;
+    }
 }
 
 HistogramStatistics WangLandauWalker::histogram_statistics() const noexcept {
@@ -348,6 +383,13 @@ void WangLandauWalker::restore(const WalkerSnapshot& s) {
     }
     forced_accepted_ = s.forced_accepted; last_accepted_attempt_ = s.last_accepted_attempt; stage_ = s.stage;
     rng_.set_state(s.rng_state);
+    if(parameters_.collect_window_statistics) {
+        std::fill(squared_energy_displacement_.begin(),squared_energy_displacement_.end(),0.0);
+        std::fill(displacement_samples_.begin(),displacement_samples_.end(),0);
+        round_trip_state_=0;
+        round_trips_=0;
+        update_round_trip_state();
+    }
     const auto exact = total_energy(*couplings_, spins_);
     if (std::abs(exact - energy_) > 1e-9 * std::max(1.0, std::abs(exact)))
         throw std::runtime_error("Checkpoint energy does not match spin configuration");
@@ -368,6 +410,7 @@ void WangLandauWalker::replace_configuration(std::span<const std::int8_t> spins,
     std::copy(spins.begin(), spins.end(), spins_.begin());
     std::copy(fields.begin(), fields.end(), fields_.begin());
     energy_ = energy;
+    update_round_trip_state();
 }
 
 void WangLandauWalker::swap_configuration(WangLandauWalker& other) {
@@ -378,6 +421,8 @@ void WangLandauWalker::swap_configuration(WangLandauWalker& other) {
     spins_.swap(other.spins_);
     fields_.swap(other.fields_);
     std::swap(energy_, other.energy_);
+    update_round_trip_state();
+    other.update_round_trip_state();
 }
 
 double WangLandauWalker::exchange_log_probability(const WangLandauWalker& other) const {

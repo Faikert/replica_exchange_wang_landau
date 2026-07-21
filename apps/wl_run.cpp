@@ -99,6 +99,55 @@ int main(int argc,char** argv) {
             }
             return 0;
         }
+        if(config.adaptive_windows.enabled) {
+            auto windows=wl::partition_windows(config.grid.bins(),config.windows,config.overlap);
+            const auto adaptation_start=std::chrono::steady_clock::now();
+            for(std::size_t iteration=0;iteration<config.adaptive_windows.iterations;++iteration) {
+                if(parallel.rank()==0)
+                    std::cout<<"adaptive_window_pilot="<<(iteration+1)<<'/'
+                             <<config.adaptive_windows.iterations
+                             <<" pilot_mcs="<<config.adaptive_windows.pilot_mcs<<'\n';
+                auto pilot_config=config;
+                pilot_config.adaptive_windows.enabled=false;
+                pilot_config.explicit_windows=windows;
+                pilot_config.wl.collect_window_statistics=true;
+                pilot_config.max_mcs=config.adaptive_windows.pilot_mcs;
+                pilot_config.max_limit_uses_mcs=true;
+                pilot_config.checkpoint_path.clear();
+                pilot_config.resolved_spin_count=0;
+                pilot_config.seed=config.seed^
+                    ((static_cast<std::uint64_t>(iteration)+1)*0x9e3779b97f4a7c15ULL);
+                pilot_config.resolve_mcs(geometry.size());
+                const auto pilot_result=wl::run_rewl(parallel,couplings,pilot_config);
+                if(parallel.rank()==0) {
+                    windows=wl::adapt_energy_windows(config.grid,pilot_result.fragments,
+                        pilot_result.sampling_statistics,config.windows,config.overlap,
+                        config.adaptive_windows);
+                    std::uint64_t round_trips=0;
+                    for(const auto& statistic:pilot_result.sampling_statistics)
+                        round_trips+=statistic.round_trips;
+                    std::cout<<"adaptive_window_round_trips="<<round_trips
+                             <<" energy_ranges=";
+                    for(std::size_t w=0;w<windows.size();++w) {
+                        if(w!=0) std::cout<<';';
+                        std::cout<<'['
+                            <<config.grid.minimum+static_cast<double>(windows[w].begin)*config.grid.width
+                            <<','
+                            <<config.grid.minimum+static_cast<double>(windows[w].end)*config.grid.width
+                            <<')';
+                    }
+                    std::cout<<'\n';
+                }
+                parallel.broadcast_windows(windows);
+            }
+            config.explicit_windows=std::move(windows);
+            config.wl.collect_window_statistics=false;
+            config.validate(!config.smoke_test);
+            if(parallel.rank()==0)
+                std::cout<<"adaptive_window_elapsed_seconds="
+                         <<std::chrono::duration<double>(
+                               std::chrono::steady_clock::now()-adaptation_start).count()<<'\n';
+        }
         const auto start=std::chrono::steady_clock::now();
         const auto result=wl::run_rewl(parallel,couplings,config);
         const auto elapsed_seconds=

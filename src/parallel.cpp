@@ -21,7 +21,8 @@ namespace wl {
 namespace {
 
 DosFragment summarize_impl(EnergyWindow window,
-                           std::span<const WangLandauWalker* const> walkers,std::size_t bins) {
+                           std::span<const WangLandauWalker* const> walkers,std::size_t bins,
+                           bool allow_empty_intersection) {
     const auto nan=std::numeric_limits<double>::quiet_NaN();
     DosFragment f{window,std::vector<double>(bins,nan),std::vector<std::uint64_t>(bins,0),
                   std::vector<double>(bins,nan),std::vector<std::uint8_t>(bins,0)};
@@ -35,6 +36,8 @@ DosFragment summarize_impl(EnergyWindow window,
     }
     const auto reference=std::find(f.valid.begin()+static_cast<std::ptrdiff_t>(window.begin),
                                    f.valid.begin()+static_cast<std::ptrdiff_t>(window.end),1);
+    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(window.end) && allow_empty_intersection)
+        return f;
     if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(window.end))
         throw std::runtime_error("Walkers in an energy window have no common active bin");
     const auto reference_bin=static_cast<std::size_t>(reference-f.valid.begin());
@@ -58,10 +61,27 @@ DosFragment summarize_impl(EnergyWindow window,
     return f;
 }
 
+WindowSamplingStatistics summarize_sampling_impl(
+    EnergyWindow window,std::span<const WangLandauWalker* const> walkers,std::size_t bins) {
+    WindowSamplingStatistics result{window,std::vector<double>(bins,0.0),
+                                    std::vector<std::uint64_t>(bins,0),0,
+                                    static_cast<std::uint64_t>(walkers.size())};
+    for(const auto* walker:walkers) {
+        if(walker->squared_energy_displacement().empty()) continue;
+        for(std::size_t i=window.begin;i<window.end;++i) {
+            result.squared_energy_displacement[i]+=walker->squared_energy_displacement()[i];
+            result.displacement_samples[i]+=walker->displacement_samples()[i];
+        }
+        result.round_trips+=walker->round_trips();
+    }
+    return result;
+}
+
 #ifdef WL_HAS_MPI
 DosFragment summarize_distributed(EnergyWindow window,
                                   std::span<const std::unique_ptr<WangLandauWalker>> walkers,
-                                  std::size_t bins,MPI_Comm communicator) {
+                                  std::size_t bins,MPI_Comm communicator,
+                                  bool allow_empty_intersection) {
     const auto nan=std::numeric_limits<double>::quiet_NaN();
     DosFragment f{window,std::vector<double>(bins,nan),std::vector<std::uint64_t>(bins,0),
                   std::vector<double>(bins,nan),std::vector<std::uint8_t>(bins,0)};
@@ -82,6 +102,8 @@ DosFragment summarize_distributed(EnergyWindow window,
     f.histogram=std::move(global_histogram);
     const auto reference=std::find(f.valid.begin()+static_cast<std::ptrdiff_t>(window.begin),
                                    f.valid.begin()+static_cast<std::ptrdiff_t>(window.end),1);
+    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(window.end) && allow_empty_intersection)
+        return f;
     if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(window.end))
         throw std::runtime_error("Walkers in an MPI energy window have no common active bin");
     const auto reference_bin=static_cast<std::size_t>(reference-f.valid.begin());
@@ -111,6 +133,25 @@ DosFragment summarize_distributed(EnergyWindow window,
     }
     return f;
 }
+
+WindowSamplingStatistics summarize_sampling_distributed(
+    EnergyWindow window,std::span<const std::unique_ptr<WangLandauWalker>> walkers,
+    std::size_t bins,MPI_Comm communicator) {
+    std::vector<const WangLandauWalker*> pointers;
+    pointers.reserve(walkers.size());
+    for(const auto& walker:walkers) pointers.push_back(walker.get());
+    auto local=summarize_sampling_impl(window,pointers,bins);
+    WindowSamplingStatistics result{window,std::vector<double>(bins,0.0),
+                                    std::vector<std::uint64_t>(bins,0)};
+    MPI_Allreduce(local.squared_energy_displacement.data(),
+                  result.squared_energy_displacement.data(),static_cast<int>(bins),MPI_DOUBLE,
+                  MPI_SUM,communicator);
+    MPI_Allreduce(local.displacement_samples.data(),result.displacement_samples.data(),
+                  static_cast<int>(bins),MPI_UINT64_T,MPI_SUM,communicator);
+    MPI_Allreduce(&local.round_trips,&result.round_trips,1,MPI_UINT64_T,MPI_SUM,communicator);
+    MPI_Allreduce(&local.walkers,&result.walkers,1,MPI_UINT64_T,MPI_SUM,communicator);
+    return result;
+}
 #endif
 
 bool local_exchange(WangLandauWalker& left, WangLandauWalker& right,
@@ -128,13 +169,13 @@ bool local_exchange(WangLandauWalker& left, WangLandauWalker& right,
 
 DosFragment summarize_walkers(EnergyWindow window,
                               std::span<const WangLandauWalker* const> walkers,
-                              std::size_t bins) {
+                              std::size_t bins,bool allow_empty_intersection) {
     if(walkers.empty()) throw std::invalid_argument("No walkers to summarize");
     for(const auto* walker:walkers)
         if(!walker||walker->log_g().size()!=bins||walker->window().begin!=window.begin||
            walker->window().end!=window.end)
             throw std::invalid_argument("Cannot summarize incompatible walkers");
-    return summarize_impl(window,walkers,bins);
+    return summarize_impl(window,walkers,bins,allow_empty_intersection);
 }
 
 ParallelContext::ParallelContext(int& argc,char**& argv) {
@@ -164,6 +205,27 @@ std::uint64_t ParallelContext::broadcast_seed(std::uint64_t seed) const {
     return seed;
 }
 
+void ParallelContext::broadcast_windows(std::vector<EnergyWindow>& windows) const {
+#ifdef WL_HAS_MPI
+    std::uint64_t count=rank_==0?static_cast<std::uint64_t>(windows.size()):0;
+    MPI_Bcast(&count,1,MPI_UINT64_T,0,MPI_COMM_WORLD);
+    std::vector<std::uint64_t> packed(static_cast<std::size_t>(count)*2);
+    if(rank_==0) for(std::size_t i=0;i<windows.size();++i) {
+        packed[2*i]=static_cast<std::uint64_t>(windows[i].begin);
+        packed[2*i+1]=static_cast<std::uint64_t>(windows[i].end);
+    }
+    MPI_Bcast(packed.data(),static_cast<int>(packed.size()),MPI_UINT64_T,0,MPI_COMM_WORLD);
+    if(rank_!=0) {
+        windows.resize(static_cast<std::size_t>(count));
+        for(std::size_t i=0;i<windows.size();++i)
+            windows[i]={static_cast<std::size_t>(packed[2*i]),
+                        static_cast<std::size_t>(packed[2*i+1])};
+    }
+#else
+    (void)windows;
+#endif
+}
+
 int maximum_openmp_threads() noexcept {
 #ifdef WL_HAS_OPENMP
     return omp_get_max_threads();
@@ -176,7 +238,8 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                     const RunConfig& c) {
     if(!couplings) throw std::invalid_argument("Null couplings");
     c.validate(!c.smoke_test);
-    const auto windows=partition_windows(c.grid.bins(),c.windows,c.overlap);
+    const auto windows=c.explicit_windows.empty()?
+        partition_windows(c.grid.bins(),c.windows,c.overlap):c.explicit_windows;
     const bool distributed=context.size()>1;
     if(distributed && context.size()%static_cast<int>(c.windows)!=0)
         throw std::invalid_argument("MPI size must be a multiple of the number of energy windows");
@@ -433,19 +496,27 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 walker->attempted(),walker->accepted(),walker->forced_accepted(),
                 walker->attempted()-last_accepted,walker->energy(),
                 walker->factor(),histogram.active_bins,histogram.minimum,
-                histogram.mean,histogram.min_over_mean});
+                histogram.mean,histogram.min_over_mean,walker->round_trips()});
         }
 #ifdef WL_HAS_MPI
-        if(distributed)
+        if(distributed) {
             result.fragments.push_back(summarize_distributed(windows[w],groups[w],c.grid.bins(),
-                                                             window_comm));
-        else
+                                                             window_comm,
+                                                             c.wl.collect_window_statistics));
+            if(c.wl.collect_window_statistics)
+                result.sampling_statistics.push_back(summarize_sampling_distributed(
+                    windows[w],groups[w],c.grid.bins(),window_comm));
+        } else
 #endif
         {
             std::vector<const WangLandauWalker*> pointers;
             pointers.reserve(groups[w].size());
             for(const auto& walker:groups[w]) pointers.push_back(walker.get());
-            result.fragments.push_back(summarize_walkers(windows[w],pointers,c.grid.bins()));
+            result.fragments.push_back(summarize_walkers(windows[w],pointers,c.grid.bins(),
+                                                         c.wl.collect_window_statistics));
+            if(c.wl.collect_window_statistics)
+                result.sampling_statistics.push_back(summarize_sampling_impl(
+                    windows[w],pointers,c.grid.bins()));
         }
     }
     result.attempted=local_attempted; result.accepted=local_accepted; result.converged=local_converged;
@@ -472,7 +543,7 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
         MPI_Gather(local_fragment.valid.data(),static_cast<int>(bins),MPI_UNSIGNED_CHAR,
                    all_valid.data(),static_cast<int>(bins),MPI_UNSIGNED_CHAR,0,MPI_COMM_WORLD);
         const auto local_stat_count=result.walker_statistics.size();
-        constexpr std::size_t statistic_integer_fields=9;
+        constexpr std::size_t statistic_integer_fields=10;
         constexpr std::size_t statistic_double_fields=4;
         std::vector<std::uint64_t> local_stat_integers(local_stat_count*statistic_integer_fields);
         std::vector<double> local_stat_doubles(local_stat_count*statistic_double_fields);
@@ -489,6 +560,7 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
             local_stat_integers[integer_offset+6]=statistic.attempts_since_last_accepted;
             local_stat_integers[integer_offset+7]=static_cast<std::uint64_t>(statistic.active_bins);
             local_stat_integers[integer_offset+8]=statistic.minimum_histogram;
+            local_stat_integers[integer_offset+9]=statistic.round_trips;
             local_stat_doubles[double_offset]=statistic.energy;
             local_stat_doubles[double_offset+1]=statistic.factor;
             local_stat_doubles[double_offset+2]=statistic.mean_histogram;
@@ -505,6 +577,28 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
         MPI_Gather(local_stat_doubles.data(),static_cast<int>(local_stat_doubles.size()),MPI_DOUBLE,
                    all_stat_doubles.data(),static_cast<int>(local_stat_doubles.size()),MPI_DOUBLE,0,MPI_COMM_WORLD);
         result.fragments.clear();
+        std::vector<double> all_displacement;
+        std::vector<std::uint64_t> all_displacement_samples;
+        std::vector<std::uint64_t> all_sampling_scalars;
+        if(c.wl.collect_window_statistics) {
+            const auto& local_sampling=result.sampling_statistics.front();
+            if(context.rank()==0) {
+                all_displacement.resize(bins*context.size());
+                all_displacement_samples.resize(bins*context.size());
+                all_sampling_scalars.resize(2*context.size());
+            }
+            MPI_Gather(local_sampling.squared_energy_displacement.data(),static_cast<int>(bins),
+                       MPI_DOUBLE,all_displacement.data(),static_cast<int>(bins),MPI_DOUBLE,0,
+                       MPI_COMM_WORLD);
+            MPI_Gather(local_sampling.displacement_samples.data(),static_cast<int>(bins),MPI_UINT64_T,
+                       all_displacement_samples.data(),static_cast<int>(bins),MPI_UINT64_T,0,
+                       MPI_COMM_WORLD);
+            const std::uint64_t local_sampling_scalars[2]{local_sampling.round_trips,
+                                                           local_sampling.walkers};
+            MPI_Gather(local_sampling_scalars,2,MPI_UINT64_T,all_sampling_scalars.data(),2,
+                       MPI_UINT64_T,0,MPI_COMM_WORLD);
+        }
+        result.sampling_statistics.clear();
         result.walker_statistics.clear();
         if(context.rank()==0) {
             result.attempted=reduced[0]; result.accepted=reduced[1]; result.forced_accepted=reduced[2];
@@ -523,7 +617,7 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                     all_stat_doubles[double_offset+1],
                     static_cast<std::size_t>(all_stat_integers[integer_offset+7]),
                     all_stat_integers[integer_offset+8],all_stat_doubles[double_offset+2],
-                    all_stat_doubles[double_offset+3]});
+                    all_stat_doubles[double_offset+3],all_stat_integers[integer_offset+9]});
             }
             for(std::size_t w=0;w<c.windows;++w) {
                 const auto leader_rank=w*shards;
@@ -537,6 +631,17 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                             f.standard_error.begin());
                 std::copy_n(all_valid.begin()+static_cast<std::ptrdiff_t>(offset),bins,f.valid.begin());
                 result.fragments.push_back(std::move(f));
+                if(c.wl.collect_window_statistics) {
+                    WindowSamplingStatistics sampling_result{
+                        windows[w],std::vector<double>(bins),std::vector<std::uint64_t>(bins),
+                        all_sampling_scalars[2*leader_rank],
+                        all_sampling_scalars[2*leader_rank+1]};
+                    std::copy_n(all_displacement.begin()+static_cast<std::ptrdiff_t>(offset),bins,
+                                sampling_result.squared_energy_displacement.begin());
+                    std::copy_n(all_displacement_samples.begin()+static_cast<std::ptrdiff_t>(offset),
+                                bins,sampling_result.displacement_samples.begin());
+                    result.sampling_statistics.push_back(std::move(sampling_result));
+                }
             }
         }
         MPI_Comm_free(&window_comm);
