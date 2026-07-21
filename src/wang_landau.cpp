@@ -103,6 +103,16 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
     if(parameters_.collect_window_statistics) {
         squared_energy_displacement_.assign(grid_.bins(),0.0);
         displacement_samples_.assign(grid_.bins(),0);
+        constexpr std::size_t representative_count=9;
+        const auto lower=grid_.minimum+static_cast<double>(window_.begin)*grid_.width;
+        const auto upper=grid_.minimum+static_cast<double>(window_.end)*grid_.width;
+        representative_targets_.reserve(representative_count);
+        for(std::size_t r=0;r<representative_count;++r)
+            representative_targets_.push_back(lower+(upper-lower)*
+                (static_cast<double>(r)+0.5)/static_cast<double>(representative_count));
+        representative_distances_.assign(representative_count,
+                                          std::numeric_limits<double>::infinity());
+        representatives_.resize(representative_count);
     }
 
     // An explicitly supplied in-window configuration is authoritative. Otherwise sample
@@ -112,6 +122,7 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
     if(supplied_initial_configuration && initial_bin && window_.contains(*initial_bin)) {
         update_current_bin();
         update_round_trip_state();
+        update_representatives();
         return;
     }
     const auto lower=grid_.minimum+static_cast<double>(window_.begin)*grid_.width;
@@ -156,7 +167,7 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
     };
     for (std::uint64_t step = 0; step < parameters_.initialization_max_attempts; ++step) {
         if (inside_target_band(energy_)) {
-            update_current_bin(); update_round_trip_state(); return;
+            update_current_bin(); update_round_trip_state(); update_representatives(); return;
         }
         if(attempts_since_improvement>=stall_attempts) {
             if(search_temperature<maximum_search_temperature) {
@@ -176,7 +187,7 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
             }
             attempts_since_improvement=0;
             if(inside_target_band(energy_)) {
-                update_current_bin(); update_round_trip_state(); return;
+                update_current_bin(); update_round_trip_state(); update_representatives(); return;
             }
         }
         const auto i = static_cast<std::size_t>(rng_.bounded(spins_.size()));
@@ -198,7 +209,7 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
             ++attempts_since_improvement;
     }
     if (inside_target_band(energy_)) {
-        update_current_bin(); update_round_trip_state(); return;
+        update_current_bin(); update_round_trip_state(); update_representatives(); return;
     }
     std::ostringstream message;
     message<<std::setprecision(17)
@@ -258,7 +269,10 @@ bool WangLandauWalker::attempt_flip() {
     }
     update_inverse_time_factor();
     update_current_bin();
-    update_round_trip_state();
+    if(accepted) {
+        update_round_trip_state();
+        update_representatives();
+    }
     return accepted;
 }
 
@@ -301,6 +315,18 @@ void WangLandauWalker::update_round_trip_state() noexcept {
         } else if(round_trip_state_==0) round_trip_state_=1;
     } else if(energy_>=upper-margin && round_trip_state_==1) {
         round_trip_state_=2;
+    }
+}
+
+void WangLandauWalker::update_representatives() {
+    if(!parameters_.collect_window_statistics) return;
+    for(std::size_t r=0;r<representative_targets_.size();++r) {
+        const auto distance=std::abs(energy_-representative_targets_[r]);
+        if(distance<representative_distances_[r]) {
+            representative_distances_[r]=distance;
+            representatives_[r].energy=energy_;
+            representatives_[r].spins=spins_;
+        }
     }
 }
 
@@ -389,6 +415,10 @@ void WangLandauWalker::restore(const WalkerSnapshot& s) {
         round_trip_state_=0;
         round_trips_=0;
         update_round_trip_state();
+        std::fill(representative_distances_.begin(),representative_distances_.end(),
+                  std::numeric_limits<double>::infinity());
+        for(auto& representative:representatives_) representative.spins.clear();
+        update_representatives();
     }
     const auto exact = total_energy(*couplings_, spins_);
     if (std::abs(exact - energy_) > 1e-9 * std::max(1.0, std::abs(exact)))
@@ -411,6 +441,7 @@ void WangLandauWalker::replace_configuration(std::span<const std::int8_t> spins,
     std::copy(fields.begin(), fields.end(), fields_.begin());
     energy_ = energy;
     update_round_trip_state();
+    update_representatives();
 }
 
 void WangLandauWalker::swap_configuration(WangLandauWalker& other) {
@@ -423,6 +454,8 @@ void WangLandauWalker::swap_configuration(WangLandauWalker& other) {
     std::swap(energy_, other.energy_);
     update_round_trip_state();
     other.update_round_trip_state();
+    update_representatives();
+    other.update_representatives();
 }
 
 double WangLandauWalker::exchange_log_probability(const WangLandauWalker& other) const {

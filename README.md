@@ -64,7 +64,7 @@ Set `[adaptive_windows] enabled = true` or pass `--adaptive-windows true` to opt
 w(E) = round_trip_penalty(E) * [1 + curvature_weight*C(E)] / sqrt(max(D(E), D_floor))
 ```
 
-and places equal difficulty mass in every core energy interval. Low-diffusivity or high-curvature regions therefore receive narrower windows. Overlaps are added afterward using the configured fractional `parallel.overlap`. `smoothing_width` and `minimum_width` are physical energy differences and are independent of the DOS grid resolution; zero selects automatic values from the full energy span. After every pilot, all pilot `log_g` and histogram data are discarded. Production starts from fresh walkers with fixed adapted boundaries, so adaptation does not enter the production DOS estimator.
+and places equal difficulty mass in every core energy interval. Low-diffusivity or high-curvature regions therefore receive narrower windows. Overlaps are added afterward using the configured fractional `parallel.overlap`. `smoothing_width` and `minimum_width` are physical energy differences and are independent of the DOS grid resolution; zero selects automatic values from the full energy span. Each pilot also retains a small bank of actually visited spin configurations distributed across every old energy window. New windows and the final production run are seeded from the closest bank configurations that lie inside their ranges; they are not forced to rediscover extreme energies from the original state. After every pilot, all pilot `log_g` and histogram data are discarded. Production starts with fixed adapted boundaries and zeroed DOS estimators, so neither the pilot DOS nor its histogram enters the production estimate.
 
 ```ini
 [adaptive_windows]

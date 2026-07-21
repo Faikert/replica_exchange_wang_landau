@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <vector>
 
 namespace {
 std::uint64_t mix_seed(std::uint64_t value) noexcept {
@@ -25,6 +27,44 @@ std::uint64_t random_seed() {
         for(int i=0;i<4;++i) seed=mix_seed(seed^static_cast<std::uint64_t>(device()));
     } catch(const std::exception&) {}
     return mix_seed(seed);
+}
+
+std::vector<std::vector<std::int8_t>> select_adaptive_initial_configurations(
+    const wl::EnergyGrid& grid,std::span<const wl::EnergyWindow> windows,
+    std::span<const wl::EnergyRepresentative> representatives,int mpi_size,
+    std::size_t walkers_per_rank,std::size_t& missing) {
+    const bool distributed=mpi_size>1;
+    const auto shards=distributed?static_cast<std::size_t>(mpi_size)/windows.size():1;
+    const auto owner_count=distributed?static_cast<std::size_t>(mpi_size):windows.size();
+    std::vector<std::vector<std::int8_t>> result(owner_count*walkers_per_rank);
+    missing=0;
+    for(std::size_t owner=0;owner<owner_count;++owner) {
+        const auto window_id=distributed?owner/shards:owner;
+        const auto& window=windows[window_id];
+        const auto center=0.5*(grid.minimum+static_cast<double>(window.begin)*grid.width+
+                               grid.minimum+static_cast<double>(window.end)*grid.width);
+        std::vector<const wl::EnergyRepresentative*> candidates;
+        for(const auto& representative:representatives) {
+            const auto energy_bin=grid.index(representative.energy);
+            if(!representative.spins.empty()&&energy_bin&&window.contains(*energy_bin))
+                candidates.push_back(&representative);
+        }
+        std::sort(candidates.begin(),candidates.end(),[center](const auto* a,const auto* b) {
+            const auto da=std::abs(a->energy-center),db=std::abs(b->energy-center);
+            return da==db?a->energy<b->energy:da<db;
+        });
+        const auto shard=distributed?owner%shards:0;
+        for(std::size_t local=0;local<walkers_per_rank;++local) {
+            const auto id=owner*walkers_per_rank+local;
+            if(candidates.empty()) {
+                ++missing;
+                continue;
+            }
+            const auto choice=(shard*walkers_per_rank+local)%candidates.size();
+            result[id]=candidates[choice]->spins;
+        }
+    }
+    return result;
 }
 }
 
@@ -101,6 +141,7 @@ int main(int argc,char** argv) {
         }
         if(config.adaptive_windows.enabled) {
             auto windows=wl::partition_windows(config.grid.bins(),config.windows,config.overlap);
+            std::vector<std::vector<std::int8_t>> initial_configurations;
             const auto adaptation_start=std::chrono::steady_clock::now();
             for(std::size_t iteration=0;iteration<config.adaptive_windows.iterations;++iteration) {
                 if(parallel.rank()==0)
@@ -110,6 +151,7 @@ int main(int argc,char** argv) {
                 auto pilot_config=config;
                 pilot_config.adaptive_windows.enabled=false;
                 pilot_config.explicit_windows=windows;
+                pilot_config.initial_spins_by_walker=initial_configurations;
                 pilot_config.wl.collect_window_statistics=true;
                 pilot_config.max_mcs=config.adaptive_windows.pilot_mcs;
                 pilot_config.max_limit_uses_mcs=true;
@@ -119,6 +161,7 @@ int main(int argc,char** argv) {
                     ((static_cast<std::uint64_t>(iteration)+1)*0x9e3779b97f4a7c15ULL);
                 pilot_config.resolve_mcs(geometry.size());
                 const auto pilot_result=wl::run_rewl(parallel,couplings,pilot_config);
+                std::vector<std::vector<std::int8_t>> next_initial_configurations;
                 if(parallel.rank()==0) {
                     windows=wl::adapt_energy_windows(config.grid,pilot_result.fragments,
                         pilot_result.sampling_statistics,config.windows,config.overlap,
@@ -126,7 +169,14 @@ int main(int argc,char** argv) {
                     std::uint64_t round_trips=0;
                     for(const auto& statistic:pilot_result.sampling_statistics)
                         round_trips+=statistic.round_trips;
+                    std::size_t missing_configurations=0;
+                    next_initial_configurations=select_adaptive_initial_configurations(
+                        config.grid,windows,pilot_result.representatives,parallel.size(),
+                        config.walkers_per_rank,missing_configurations);
                     std::cout<<"adaptive_window_round_trips="<<round_trips
+                             <<" seeded_walkers="
+                             <<next_initial_configurations.size()-missing_configurations<<'/'
+                             <<next_initial_configurations.size()
                              <<" energy_ranges=";
                     for(std::size_t w=0;w<windows.size();++w) {
                         if(w!=0) std::cout<<';';
@@ -139,8 +189,11 @@ int main(int argc,char** argv) {
                     std::cout<<'\n';
                 }
                 parallel.broadcast_windows(windows);
+                parallel.broadcast_spin_configurations(next_initial_configurations);
+                initial_configurations=std::move(next_initial_configurations);
             }
             config.explicit_windows=std::move(windows);
+            config.initial_spins_by_walker=std::move(initial_configurations);
             config.wl.collect_window_statistics=false;
             config.validate(!config.smoke_test);
             if(parallel.rank()==0)

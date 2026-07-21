@@ -226,6 +226,45 @@ void ParallelContext::broadcast_windows(std::vector<EnergyWindow>& windows) cons
 #endif
 }
 
+void ParallelContext::broadcast_spin_configurations(
+    std::vector<std::vector<std::int8_t>>& configurations) const {
+#ifdef WL_HAS_MPI
+    std::uint64_t count=rank_==0?static_cast<std::uint64_t>(configurations.size()):0;
+    MPI_Bcast(&count,1,MPI_UINT64_T,0,MPI_COMM_WORLD);
+    std::vector<std::uint64_t> sizes(static_cast<std::size_t>(count),0);
+    std::uint64_t total=0;
+    if(rank_==0) for(std::size_t i=0;i<configurations.size();++i) {
+        sizes[i]=static_cast<std::uint64_t>(configurations[i].size());
+        total+=sizes[i];
+    }
+    MPI_Bcast(sizes.data(),static_cast<int>(sizes.size()),MPI_UINT64_T,0,MPI_COMM_WORLD);
+    for(const auto size:sizes) total+=rank_==0?0:size;
+    if(total>static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+        throw std::runtime_error("Adaptive spin-configuration bank is too large for MPI");
+    std::vector<std::int8_t> packed(static_cast<std::size_t>(total));
+    if(rank_==0) {
+        std::size_t offset=0;
+        for(const auto& configuration:configurations) {
+            std::copy(configuration.begin(),configuration.end(),packed.begin()+
+                      static_cast<std::ptrdiff_t>(offset));
+            offset+=configuration.size();
+        }
+    }
+    MPI_Bcast(packed.data(),static_cast<int>(packed.size()),MPI_BYTE,0,MPI_COMM_WORLD);
+    if(rank_!=0) {
+        configurations.resize(static_cast<std::size_t>(count));
+        std::size_t offset=0;
+        for(std::size_t i=0;i<configurations.size();++i) {
+            configurations[i].assign(packed.begin()+static_cast<std::ptrdiff_t>(offset),
+                                     packed.begin()+static_cast<std::ptrdiff_t>(offset+sizes[i]));
+            offset+=static_cast<std::size_t>(sizes[i]);
+        }
+    }
+#else
+    (void)configurations;
+#endif
+}
+
 int maximum_openmp_threads() noexcept {
 #ifdef WL_HAS_OPENMP
     return omp_get_max_threads();
@@ -244,6 +283,15 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
     if(distributed && context.size()%static_cast<int>(c.windows)!=0)
         throw std::invalid_argument("MPI size must be a multiple of the number of energy windows");
     const auto shards=distributed?static_cast<std::size_t>(context.size())/c.windows:1;
+    const auto expected_initial_configurations=(distributed?
+        static_cast<std::size_t>(context.size()):c.windows)*c.walkers_per_rank;
+    if(!c.initial_spins_by_walker.empty()) {
+        if(c.initial_spins_by_walker.size()!=expected_initial_configurations)
+            throw std::invalid_argument("Adaptive initial-configuration count mismatch");
+        for(const auto& spins:c.initial_spins_by_walker)
+            if(!spins.empty()&&spins.size()!=couplings->size())
+                throw std::invalid_argument("Adaptive initial spin count mismatch");
+    }
     const auto window_id=distributed?static_cast<std::size_t>(context.rank())/shards:0;
     const auto first_window=distributed?window_id:0;
     const auto last_window=distributed?window_id+1:c.windows;
@@ -264,8 +312,11 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 initialization_walker=local;
                 const auto global_id=(distributed?static_cast<std::uint64_t>(context.rank()):w)*
                                      c.walkers_per_rank+local;
+                std::vector<std::int8_t> initial_spins;
+                if(!c.initial_spins_by_walker.empty())
+                    initial_spins=c.initial_spins_by_walker[static_cast<std::size_t>(global_id)];
                 group.push_back(std::make_unique<WangLandauWalker>(
-                    global_id,couplings,c.grid,windows[w],c.wl,c.seed));
+                    global_id,couplings,c.grid,windows[w],c.wl,c.seed,std::move(initial_spins)));
             }
         }
     }
@@ -497,6 +548,10 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 walker->attempted()-last_accepted,walker->energy(),
                 walker->factor(),histogram.active_bins,histogram.minimum,
                 histogram.mean,histogram.min_over_mean,walker->round_trips()});
+            if(c.wl.collect_window_statistics)
+                for(const auto& representative:walker->representatives())
+                    if(!representative.spins.empty())
+                        result.representatives.push_back(representative);
         }
 #ifdef WL_HAS_MPI
         if(distributed) {
@@ -598,7 +653,31 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
             MPI_Gather(local_sampling_scalars,2,MPI_UINT64_T,all_sampling_scalars.data(),2,
                        MPI_UINT64_T,0,MPI_COMM_WORLD);
         }
+        std::vector<double> all_representative_energies;
+        std::vector<std::int8_t> all_representative_spins;
+        if(c.wl.collect_window_statistics) {
+            const auto local_representative_count=result.representatives.size();
+            std::vector<double> local_energies(local_representative_count);
+            std::vector<std::int8_t> local_spins(local_representative_count*couplings->size());
+            for(std::size_t i=0;i<local_representative_count;++i) {
+                local_energies[i]=result.representatives[i].energy;
+                std::copy(result.representatives[i].spins.begin(),
+                          result.representatives[i].spins.end(),
+                          local_spins.begin()+static_cast<std::ptrdiff_t>(i*couplings->size()));
+            }
+            if(context.rank()==0) {
+                all_representative_energies.resize(local_representative_count*context.size());
+                all_representative_spins.resize(local_spins.size()*context.size());
+            }
+            MPI_Gather(local_energies.data(),static_cast<int>(local_energies.size()),MPI_DOUBLE,
+                       all_representative_energies.data(),static_cast<int>(local_energies.size()),
+                       MPI_DOUBLE,0,MPI_COMM_WORLD);
+            MPI_Gather(local_spins.data(),static_cast<int>(local_spins.size()),MPI_BYTE,
+                       all_representative_spins.data(),static_cast<int>(local_spins.size()),
+                       MPI_BYTE,0,MPI_COMM_WORLD);
+        }
         result.sampling_statistics.clear();
+        result.representatives.clear();
         result.walker_statistics.clear();
         if(context.rank()==0) {
             result.attempted=reduced[0]; result.accepted=reduced[1]; result.forced_accepted=reduced[2];
@@ -641,6 +720,20 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                     std::copy_n(all_displacement_samples.begin()+static_cast<std::ptrdiff_t>(offset),
                                 bins,sampling_result.displacement_samples.begin());
                     result.sampling_statistics.push_back(std::move(sampling_result));
+                }
+            }
+            if(c.wl.collect_window_statistics) {
+                const auto count=all_representative_energies.size();
+                result.representatives.reserve(count);
+                for(std::size_t i=0;i<count;++i) {
+                    EnergyRepresentative representative;
+                    representative.energy=all_representative_energies[i];
+                    const auto offset=i*couplings->size();
+                    representative.spins.assign(
+                        all_representative_spins.begin()+static_cast<std::ptrdiff_t>(offset),
+                        all_representative_spins.begin()+
+                            static_cast<std::ptrdiff_t>(offset+couplings->size()));
+                    result.representatives.push_back(std::move(representative));
                 }
             }
         }

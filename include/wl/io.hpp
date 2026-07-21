@@ -25,6 +25,7 @@ struct RunConfig {
     std::size_t walkers_per_rank{1};
     double overlap{0.75};
     std::vector<EnergyWindow> explicit_windows;
+    std::vector<std::vector<std::int8_t>> initial_spins_by_walker;
     AdaptiveWindowParameters adaptive_windows;
     std::uint64_t seed{1};
     bool seed_explicit{false};

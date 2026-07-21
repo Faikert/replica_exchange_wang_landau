@@ -63,6 +63,11 @@ struct HistogramStatistics {
     double min_over_mean{};
 };
 
+struct EnergyRepresentative {
+    double energy{};
+    std::vector<std::int8_t> spins;
+};
+
 struct WalkerSnapshot {
     std::uint64_t walker_id{};
     std::vector<std::int8_t> spins;
@@ -113,6 +118,9 @@ public:
         return displacement_samples_;
     }
     [[nodiscard]] std::uint64_t round_trips() const noexcept { return round_trips_; }
+    [[nodiscard]] const std::vector<EnergyRepresentative>& representatives() const noexcept {
+        return representatives_;
+    }
     [[nodiscard]] std::uint64_t attempted() const noexcept { return attempted_; }
     [[nodiscard]] std::uint64_t accepted() const noexcept { return accepted_; }
     [[nodiscard]] std::uint64_t forced_accepted() const noexcept { return forced_accepted_; }
@@ -149,11 +157,15 @@ private:
     RefinementStage stage_{RefinementStage::wang_landau};
     std::uint8_t round_trip_state_{};
     std::uint64_t round_trips_{};
+    std::vector<double> representative_targets_;
+    std::vector<double> representative_distances_;
+    std::vector<EnergyRepresentative> representatives_;
 
     void update_current_bin();
     [[nodiscard]] std::size_t active_bins() const noexcept;
     void update_inverse_time_factor();
     void update_round_trip_state() noexcept;
+    void update_representatives();
 };
 
 } // namespace wl

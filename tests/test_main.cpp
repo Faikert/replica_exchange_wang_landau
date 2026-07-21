@@ -469,6 +469,11 @@ void test_adaptive_energy_windows() {
         walker.squared_energy_displacement().end(),0.0);
     require(recorded==5'000&&motion>0.0,"energy diffusivity statistics are collected");
     require(walker.round_trips()>0,"complete low-high-low energy trips are counted");
+    require(walker.representatives().size()==9,
+            "adaptive pilot keeps a fixed physical-energy configuration bank");
+    for(const auto& representative:walker.representatives())
+        require(representative.spins.size()==2&&walker_grid.index(representative.energy).has_value(),
+                "adaptive representative contains a valid reusable spin configuration");
 }
 
 void test_histogram_statistics() {

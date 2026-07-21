@@ -14,6 +14,8 @@ public:
     [[nodiscard]] int size() const noexcept { return size_; }
     [[nodiscard]] std::uint64_t broadcast_seed(std::uint64_t seed) const;
     void broadcast_windows(std::vector<EnergyWindow>& windows) const;
+    void broadcast_spin_configurations(
+        std::vector<std::vector<std::int8_t>>& configurations) const;
     [[nodiscard]] bool mpi_enabled() const noexcept { return mpi_enabled_; }
 private:
     int rank_{0}; int size_{1}; bool mpi_enabled_{false}; bool owns_mpi_{false};
@@ -22,6 +24,7 @@ struct RewlResult {
     std::vector<DosFragment> fragments;
     std::vector<WalkerStatistics> walker_statistics;
     std::vector<WindowSamplingStatistics> sampling_statistics;
+    std::vector<EnergyRepresentative> representatives;
     std::uint64_t attempted{}, accepted{}, forced_accepted{};
     std::uint64_t exchange_attempted{}, exchange_accepted{};
     bool converged{false};
