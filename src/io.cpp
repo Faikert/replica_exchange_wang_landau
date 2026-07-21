@@ -469,6 +469,9 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         << "\", \"windows\": "<<c.windows
         << ", \"walkers_per_rank\": "<<c.walkers_per_rank<<", \"overlap\": "<<c.overlap
         << ", \"flatness\": "<<c.wl.flatness<<", \"flatness_scope\": \"walker_local\""
+        << ", \"initial_refinement_criterion\": \""
+        <<(c.wl.inverse_time_enabled?"full_coverage_of_discovered_bins":"histogram_flatness")<<"\""
+        << ", \"inverse_time_clock\": \"walker_local_attempted_flips/active_bins\""
         << ", \"dos_synchronization\": \"none\""
         << ", \"refinement_schedule\": \"walker_independent\""
         << ", \"final_dos_combination\": \"aligned_log_mean\""

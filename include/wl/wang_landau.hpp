@@ -58,9 +58,11 @@ enum class RefinementStage : std::uint8_t { wang_landau, inverse_time, frozen };
 
 struct HistogramStatistics {
     std::size_t active_bins{};
+    std::size_t covered_bins{};
     std::uint64_t minimum{};
     double mean{};
     double min_over_mean{};
+    double coverage{};
 };
 
 struct EnergyRepresentative {
@@ -95,6 +97,7 @@ public:
     bool attempt_flip();
     void run_attempts(std::uint64_t count);
     [[nodiscard]] bool flat() const;
+    [[nodiscard]] bool covered() const;
     [[nodiscard]] bool ready_for_iteration() const;
     void begin_next_iteration();
     void freeze_if_finished();

@@ -236,7 +236,7 @@ void test_refinement_transition() {
     wl::WlParameters p{0.1,1,0.01,1}; wl::EnergyGrid grid{-1,1,0.5};
     wl::WangLandauWalker walker(1,couplings,grid,{0,grid.bins()},p,9);
     for(int iteration=0;iteration<10&&walker.stage()==wl::RefinementStage::wang_landau;++iteration) {
-        walker.run_attempts(10); require(walker.ready_for_iteration(),"single-bin histogram flatness");
+        walker.run_attempts(10); require(walker.ready_for_iteration(),"single-bin histogram coverage");
         walker.begin_next_iteration();
     }
     require(walker.stage()!=wl::RefinementStage::wang_landau,"WL must enter inverse-time refinement");
@@ -308,6 +308,7 @@ void test_unlimited_max_attempts() {
     blocked.grid={0.5,1.5,0.25};
     blocked.max_attempts=5;
     blocked.wl={0.8,100,1e-8,1};
+    blocked.wl.inverse_time_enabled=false;
     const auto blocked_result=wl::run_rewl(context,blocked_couplings,blocked);
     require(!blocked_result.converged,"blocked walker must stop unconverged");
     require(blocked_result.walker_statistics.size()==1,"blocked walker statistics");
@@ -474,6 +475,27 @@ void test_adaptive_energy_windows() {
     for(const auto& representative:walker.representatives())
         require(representative.spins.size()==2&&walker_grid.index(representative.energy).has_value(),
                 "adaptive representative contains a valid reusable spin configuration");
+    for(const auto& representative:walker.representatives())
+        require(walker.representatives().front().energy<=representative.energy,
+                "adaptive representative bank preserves its minimum energy");
+
+    const std::vector<wl::EnergyWindow> seed_windows{{0,6},{4,10}};
+    const std::vector<wl::EnergyRepresentative> seed_representatives{
+        {-1.0,{-1,-1}},{-0.25,{-1,1}},{0.75,{1,-1}}};
+    std::size_t missing=0,external_warm_starts=0;
+    const auto starts=wl::select_adaptive_initial_configurations(
+        walker_grid,seed_windows,seed_representatives,1,2,missing,external_warm_starts);
+    require(starts.size()==4&&starts[0]==seed_representatives[0].spins&&
+            starts[1]==seed_representatives[0].spins,
+            "all walkers in the lower edge window start from the minimum-energy configuration");
+    require(missing==0&&external_warm_starts==0,
+            "in-window minimum seeds are counted as regular adaptive starts");
+    const auto distributed_starts=wl::select_adaptive_initial_configurations(
+        walker_grid,seed_windows,seed_representatives,4,2,missing,external_warm_starts);
+    require(distributed_starts.size()==8&&
+            std::all_of(distributed_starts.begin(),distributed_starts.begin()+4,
+                [&](const auto& spins) { return spins==seed_representatives[0].spins; }),
+            "every MPI owner of the lower edge window receives the minimum-energy seed");
 
     wl::WlParameters warm_parameters;
     warm_parameters.initialization_max_attempts=1;
@@ -497,10 +519,13 @@ void test_histogram_statistics() {
     walker.restore(snapshot);
     auto statistics=walker.histogram_statistics();
     require(statistics.active_bins==2,"active histogram bins");
+    require(statistics.covered_bins==2,"covered histogram bins");
     require(statistics.minimum==80,"minimum active histogram");
     near(statistics.mean,100.0,1e-14,"mean active histogram");
     near(statistics.min_over_mean,0.8,1e-14,"histogram min over mean");
+    near(statistics.coverage,1.0,1e-14,"complete active-bin coverage");
     require(walker.flat(),"inactive zero bins must not affect flatness");
+    require(walker.covered(),"inactive zero bins must not affect coverage");
 
     snapshot=walker.snapshot();
     snapshot.active[2]=1;
@@ -508,9 +533,12 @@ void test_histogram_statistics() {
     walker.restore(snapshot);
     statistics=walker.histogram_statistics();
     require(statistics.active_bins==3&&statistics.minimum==0,"active zero histogram bin");
+    require(statistics.covered_bins==2,"active zero bin is not covered");
     near(statistics.mean,200.0/3.0,1e-14,"mean with active zero bin");
     near(statistics.min_over_mean,0.0,1e-14,"zero histogram ratio");
+    near(statistics.coverage,2.0/3.0,1e-14,"partial active-bin coverage");
     require(!walker.flat(),"active zero bin must block flatness");
+    require(!walker.covered(),"active zero bin must block coverage");
 
     snapshot=walker.snapshot();
     snapshot.attempted=1000;
@@ -523,6 +551,16 @@ void test_histogram_statistics() {
     near(walker.factor(),0.5,1e-14,"local flatness iteration factor");
 
     snapshot=walker.snapshot();
+    snapshot.stage=wl::RefinementStage::wang_landau;
+    snapshot.factor=1.0;
+    snapshot.active[0]=snapshot.active[1]=1;
+    snapshot.histogram[0]=1;
+    snapshot.histogram[1]=1000;
+    walker.restore(snapshot);
+    require(!walker.flat()&&walker.covered()&&walker.ready_for_iteration(),
+            "1/t initial stage uses complete coverage instead of histogram flatness");
+
+    snapshot=walker.snapshot();
     snapshot.stage=wl::RefinementStage::inverse_time;
     snapshot.factor=0.002;
     walker.restore(snapshot);
@@ -530,6 +568,34 @@ void test_histogram_statistics() {
     near(walker.factor(),2.0/1001.0,1e-14,"restored active-bin cache");
     walker.attempt_flip();
     near(walker.factor(),3.0/1002.0,1e-14,"new active bin increments cache");
+
+    wl::WlParameters local_clock_parameters{0.99,100,1e-8,1};
+    wl::WangLandauWalker early(31,couplings,grid,{0,grid.bins()},local_clock_parameters,19);
+    wl::WangLandauWalker late(32,couplings,grid,{0,grid.bins()},local_clock_parameters,19);
+    auto early_snapshot=early.snapshot();
+    auto late_snapshot=late.snapshot();
+    for(auto* state:{&early_snapshot,&late_snapshot}) {
+        std::fill(state->active.begin(),state->active.end(),0);
+        std::fill(state->histogram.begin(),state->histogram.end(),0);
+        state->active[0]=state->active[1]=1;
+        state->histogram[0]=1;
+        state->histogram[1]=1000;
+    }
+    early_snapshot.attempted=100;
+    early_snapshot.factor=0.02;
+    late_snapshot.attempted=400;
+    late_snapshot.factor=0.008;
+    early.restore(early_snapshot);
+    late.restore(late_snapshot);
+    require(early.ready_for_iteration()&&late.ready_for_iteration(),
+            "covered walkers are independently ready for 1/t");
+    early.begin_next_iteration();
+    late.begin_next_iteration();
+    require(early.stage()==wl::RefinementStage::inverse_time&&
+            late.stage()==wl::RefinementStage::inverse_time,
+            "covered walkers enter inverse-time independently");
+    near(early.factor(),2.0/100.0,1e-14,"early walker local 1/t clock");
+    near(late.factor(),2.0/400.0,1e-14,"late walker local 1/t clock");
 }
 
 void test_classic_rewl_independence_and_summary() {

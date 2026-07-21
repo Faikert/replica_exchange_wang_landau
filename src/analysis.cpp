@@ -338,4 +338,85 @@ std::vector<EnergyWindow> adapt_energy_windows(
     return result;
 }
 
+std::vector<std::vector<std::int8_t>> select_adaptive_initial_configurations(
+    const EnergyGrid& grid, std::span<const EnergyWindow> windows,
+    std::span<const EnergyRepresentative> representatives, int mpi_size,
+    std::size_t walkers_per_rank, std::size_t& missing,
+    std::size_t& external_warm_starts) {
+    if(windows.empty() || mpi_size<=0 || walkers_per_rank==0)
+        throw std::invalid_argument("Invalid adaptive initial-configuration layout");
+    const bool distributed=mpi_size>1;
+    if(distributed && static_cast<std::size_t>(mpi_size)%windows.size()!=0)
+        throw std::invalid_argument("MPI size must be divisible by adaptive window count");
+    const auto shards=distributed?static_cast<std::size_t>(mpi_size)/windows.size():1;
+    const auto owner_count=distributed?static_cast<std::size_t>(mpi_size):windows.size();
+    std::vector<std::vector<std::int8_t>> result(owner_count*walkers_per_rank);
+    missing=0;
+    external_warm_starts=0;
+
+    const EnergyRepresentative* minimum_representative=nullptr;
+    for(const auto& representative:representatives)
+        if(!representative.spins.empty() &&
+           (minimum_representative==nullptr ||
+            representative.energy<minimum_representative->energy))
+            minimum_representative=&representative;
+
+    for(std::size_t owner=0;owner<owner_count;++owner) {
+        const auto window_id=distributed?owner/shards:owner;
+        const auto& window=windows[window_id];
+        const auto center=0.5*(grid.minimum+static_cast<double>(window.begin)*grid.width+
+                               grid.minimum+static_cast<double>(window.end)*grid.width);
+        const auto lower=grid.minimum+static_cast<double>(window.begin)*grid.width;
+        const auto upper=grid.minimum+static_cast<double>(window.end)*grid.width;
+
+        // Every walker in the lower edge window starts from the lowest-energy pilot
+        // configuration. Distinct RNG streams make the trajectories independent after
+        // startup, while all local DOS estimates retain coverage of the rare low edge.
+        if(window_id==0 && minimum_representative!=nullptr) {
+            const auto minimum_bin=grid.index(minimum_representative->energy);
+            const bool external=!minimum_bin || !window.contains(*minimum_bin);
+            for(std::size_t local=0;local<walkers_per_rank;++local) {
+                const auto id=owner*walkers_per_rank+local;
+                result[id]=minimum_representative->spins;
+                if(external) ++external_warm_starts;
+            }
+            continue;
+        }
+
+        std::vector<const EnergyRepresentative*> candidates;
+        for(const auto& representative:representatives) {
+            const auto energy_bin=grid.index(representative.energy);
+            if(!representative.spins.empty()&&energy_bin&&window.contains(*energy_bin))
+                candidates.push_back(&representative);
+        }
+        const bool external=candidates.empty();
+        if(external)
+            for(const auto& representative:representatives)
+                if(!representative.spins.empty()) candidates.push_back(&representative);
+        const auto interval_distance=[lower,upper](double energy) {
+            if(energy<lower) return lower-energy;
+            if(energy>=upper) return energy-upper;
+            return 0.0;
+        };
+        std::sort(candidates.begin(),candidates.end(),[&](const auto* a,const auto* b) {
+            const auto ia=interval_distance(a->energy),ib=interval_distance(b->energy);
+            if(ia!=ib) return ia<ib;
+            const auto da=std::abs(a->energy-center),db=std::abs(b->energy-center);
+            return da==db?a->energy<b->energy:da<db;
+        });
+        const auto shard=distributed?owner%shards:0;
+        for(std::size_t local=0;local<walkers_per_rank;++local) {
+            const auto id=owner*walkers_per_rank+local;
+            if(candidates.empty()) {
+                ++missing;
+                continue;
+            }
+            const auto choice=(shard*walkers_per_rank+local)%candidates.size();
+            result[id]=candidates[choice]->spins;
+            if(external) ++external_warm_starts;
+        }
+    }
+    return result;
+}
+
 } // namespace wl

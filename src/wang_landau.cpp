@@ -107,9 +107,10 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
         const auto lower=grid_.minimum+static_cast<double>(window_.begin)*grid_.width;
         const auto upper=grid_.minimum+static_cast<double>(window_.end)*grid_.width;
         representative_targets_.reserve(representative_count);
-        for(std::size_t r=0;r<representative_count;++r)
+        representative_targets_.push_back(lower);
+        for(std::size_t r=1;r<representative_count;++r)
             representative_targets_.push_back(lower+(upper-lower)*
-                (static_cast<double>(r)+0.5)/static_cast<double>(representative_count));
+                (static_cast<double>(r)-0.5)/static_cast<double>(representative_count-1));
         representative_distances_.assign(representative_count,
                                           std::numeric_limits<double>::infinity());
         representatives_.resize(representative_count);
@@ -342,6 +343,7 @@ HistogramStatistics WangLandauWalker::histogram_statistics() const noexcept {
     for (std::size_t i = window_.begin; i < window_.end; ++i) {
         if (!active_[i]) continue;
         ++statistics.active_bins;
+        if(histogram_[i]!=0) ++statistics.covered_bins;
         statistics.minimum = std::min(statistics.minimum, histogram_[i]);
         total += static_cast<long double>(histogram_[i]);
     }
@@ -352,6 +354,8 @@ HistogramStatistics WangLandauWalker::histogram_statistics() const noexcept {
     statistics.mean = static_cast<double>(total / static_cast<long double>(statistics.active_bins));
     statistics.min_over_mean = statistics.mean > 0.0 ?
         static_cast<double>(statistics.minimum) / statistics.mean : 0.0;
+    statistics.coverage=static_cast<double>(statistics.covered_bins)/
+                        static_cast<double>(statistics.active_bins);
     return statistics;
 }
 
@@ -363,12 +367,20 @@ bool WangLandauWalker::flat() const {
            statistics.min_over_mean >= parameters_.flatness;
 }
 
+bool WangLandauWalker::covered() const {
+    if(stage_!=RefinementStage::wang_landau) return true;
+    const auto statistics=histogram_statistics();
+    return statistics.active_bins!=0 &&
+           statistics.covered_bins==statistics.active_bins;
+}
+
 bool WangLandauWalker::ready_for_iteration() const {
-    return stage_ == RefinementStage::wang_landau && flat();
+    return stage_==RefinementStage::wang_landau &&
+           (parameters_.inverse_time_enabled?covered():flat());
 }
 
 void WangLandauWalker::begin_next_iteration() {
-    if (stage_ != RefinementStage::wang_landau || !flat())
+    if(!ready_for_iteration())
         throw std::logic_error("WL iteration is not complete");
     factor_ *= 0.5;
     std::fill(histogram_.begin() + static_cast<std::ptrdiff_t>(window_.begin),

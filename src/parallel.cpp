@@ -400,7 +400,9 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 const bool at_limit=!unlimited_attempts&&attempted>=c.max_attempts;
                 if(attempted-last_flatness_check[w][local]<check_interval&&!at_limit) continue;
                 last_flatness_check[w][local]=attempted;
-                last_flatness[w][local]=walker.histogram_statistics().min_over_mean;
+                const auto histogram=walker.histogram_statistics();
+                last_flatness[w][local]=c.wl.inverse_time_enabled?
+                    histogram.coverage:histogram.min_over_mean;
                 if(walker.ready_for_iteration()) walker.begin_next_iteration();
             }
         }
@@ -504,7 +506,8 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                     line<<"progress mcs="
                         <<static_cast<double>(progress_attempted)/static_cast<double>(couplings->size())
                         <<" attempted_flips_per_walker="<<progress_attempted
-                        <<" flatness="<<progress_flatness<<" factor="<<progress_factor
+                        <<(c.wl.inverse_time_enabled?" coverage=":" flatness=")
+                        <<progress_flatness<<" factor="<<progress_factor
                         <<" stages="<<stage_counts[0]<<'/'<<stage_counts[1]<<'/'<<stage_counts[2];
                     const auto text=line.str();
                     std::cout<<'\r'<<text;

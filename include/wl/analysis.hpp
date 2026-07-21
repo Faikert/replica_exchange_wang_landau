@@ -68,5 +68,10 @@ struct ThermodynamicPoint {
     EnergyGrid grid, std::span<const DosFragment> fragments,
     std::span<const WindowSamplingStatistics> sampling, std::size_t window_count,
     double overlap, const AdaptiveWindowParameters& parameters);
+[[nodiscard]] std::vector<std::vector<std::int8_t>> select_adaptive_initial_configurations(
+    const EnergyGrid& grid, std::span<const EnergyWindow> windows,
+    std::span<const EnergyRepresentative> representatives, int mpi_size,
+    std::size_t walkers_per_rank, std::size_t& missing,
+    std::size_t& external_warm_starts);
 
 } // namespace wl
