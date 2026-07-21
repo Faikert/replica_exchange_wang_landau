@@ -474,6 +474,13 @@ void test_adaptive_energy_windows() {
     for(const auto& representative:walker.representatives())
         require(representative.spins.size()==2&&walker_grid.index(representative.energy).has_value(),
                 "adaptive representative contains a valid reusable spin configuration");
+
+    wl::WlParameters warm_parameters;
+    warm_parameters.initialization_max_attempts=1;
+    warm_parameters.initialization_target_fraction=0.1;
+    wl::WangLandauWalker warm_start(92,couplings,walker_grid,{0,3},warm_parameters,321,{1,1});
+    require(warm_start.energy_bin()&&warm_start.window().contains(*warm_start.energy_bin()),
+            "external adaptive warm start only needs to enter its new energy window");
 }
 
 void test_histogram_statistics() {

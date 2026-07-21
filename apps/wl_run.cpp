@@ -32,24 +32,38 @@ std::uint64_t random_seed() {
 std::vector<std::vector<std::int8_t>> select_adaptive_initial_configurations(
     const wl::EnergyGrid& grid,std::span<const wl::EnergyWindow> windows,
     std::span<const wl::EnergyRepresentative> representatives,int mpi_size,
-    std::size_t walkers_per_rank,std::size_t& missing) {
+    std::size_t walkers_per_rank,std::size_t& missing,std::size_t& external_warm_starts) {
     const bool distributed=mpi_size>1;
     const auto shards=distributed?static_cast<std::size_t>(mpi_size)/windows.size():1;
     const auto owner_count=distributed?static_cast<std::size_t>(mpi_size):windows.size();
     std::vector<std::vector<std::int8_t>> result(owner_count*walkers_per_rank);
     missing=0;
+    external_warm_starts=0;
     for(std::size_t owner=0;owner<owner_count;++owner) {
         const auto window_id=distributed?owner/shards:owner;
         const auto& window=windows[window_id];
         const auto center=0.5*(grid.minimum+static_cast<double>(window.begin)*grid.width+
                                grid.minimum+static_cast<double>(window.end)*grid.width);
+        const auto lower=grid.minimum+static_cast<double>(window.begin)*grid.width;
+        const auto upper=grid.minimum+static_cast<double>(window.end)*grid.width;
         std::vector<const wl::EnergyRepresentative*> candidates;
         for(const auto& representative:representatives) {
             const auto energy_bin=grid.index(representative.energy);
             if(!representative.spins.empty()&&energy_bin&&window.contains(*energy_bin))
                 candidates.push_back(&representative);
         }
-        std::sort(candidates.begin(),candidates.end(),[center](const auto* a,const auto* b) {
+        const bool external=candidates.empty();
+        if(external)
+            for(const auto& representative:representatives)
+                if(!representative.spins.empty()) candidates.push_back(&representative);
+        const auto interval_distance=[lower,upper](double energy) {
+            if(energy<lower) return lower-energy;
+            if(energy>=upper) return energy-upper;
+            return 0.0;
+        };
+        std::sort(candidates.begin(),candidates.end(),[&](const auto* a,const auto* b) {
+            const auto ia=interval_distance(a->energy),ib=interval_distance(b->energy);
+            if(ia!=ib) return ia<ib;
             const auto da=std::abs(a->energy-center),db=std::abs(b->energy-center);
             return da==db?a->energy<b->energy:da<db;
         });
@@ -62,6 +76,7 @@ std::vector<std::vector<std::int8_t>> select_adaptive_initial_configurations(
             }
             const auto choice=(shard*walkers_per_rank+local)%candidates.size();
             result[id]=candidates[choice]->spins;
+            if(external) ++external_warm_starts;
         }
     }
     return result;
@@ -170,13 +185,15 @@ int main(int argc,char** argv) {
                     for(const auto& statistic:pilot_result.sampling_statistics)
                         round_trips+=statistic.round_trips;
                     std::size_t missing_configurations=0;
+                    std::size_t external_warm_starts=0;
                     next_initial_configurations=select_adaptive_initial_configurations(
                         config.grid,windows,pilot_result.representatives,parallel.size(),
-                        config.walkers_per_rank,missing_configurations);
+                        config.walkers_per_rank,missing_configurations,external_warm_starts);
                     std::cout<<"adaptive_window_round_trips="<<round_trips
                              <<" seeded_walkers="
                              <<next_initial_configurations.size()-missing_configurations<<'/'
                              <<next_initial_configurations.size()
+                             <<" external_warm_starts="<<external_warm_starts
                              <<" energy_ranges=";
                     for(std::size_t w=0;w<windows.size();++w) {
                         if(w!=0) std::cout<<';';

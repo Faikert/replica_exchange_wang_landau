@@ -490,6 +490,7 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         << ", \"round_trip_target\": "<<c.adaptive_windows.round_trip_target
         << ", \"maximum_round_trip_penalty\": "<<c.adaptive_windows.maximum_round_trip_penalty
         << ", \"round_trip_margin_fraction\": "<<c.wl.round_trip_margin_fraction
+        << ", \"external_warm_start_target_fraction\": 1"
         << ", \"energy_ranges\": [";
     const auto metadata_windows=c.explicit_windows.empty()?
         partition_windows(c.grid.bins(),c.windows,c.overlap):c.explicit_windows;

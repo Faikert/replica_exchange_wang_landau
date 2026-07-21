@@ -129,7 +129,12 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
     const auto upper=grid_.minimum+static_cast<double>(window_.end)*grid_.width;
     const auto span=upper-lower;
     const auto target=0.5*(lower+upper);
-    const auto target_half_width=0.5*parameters_.initialization_target_fraction*span;
+    // A supplied configuration outside the window is an adaptive warm start. It only
+    // needs to enter the window; an automatically generated start still targets the
+    // configured central fraction.
+    const auto target_fraction=supplied_initial_configuration?1.0:
+        parameters_.initialization_target_fraction;
+    const auto target_half_width=0.5*target_fraction*span;
     const auto initial_search_temperature=std::max(
         grid_.width,parameters_.initialization_temperature_fraction*span);
     const auto maximum_search_temperature=std::max(
