@@ -1,11 +1,13 @@
 #include "wl/parallel.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <functional>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -47,6 +49,7 @@ void test_csv_geometry_and_ini() {
         <<"minimum_width=1.25\ndiffusivity_floor_fraction=0.08\ncurvature_weight=0.4\n"
         <<"round_trip_target=3\nmaximum_round_trip_penalty=2.5\nround_trip_margin_fraction=0.15\n"
         <<"[wl]\ncheck_interval_mcs=2.5\nforce_accept_after_mcs=3.5\ninverse_time=false\n"
+        <<"nalivaiko_mod=true\n"
         <<"[initialization]\nmax_attempts=123\ntarget_fraction=0.4\ntemperature_fraction=0.07\n"
         <<"stall_attempts_per_spin=17\ntemperature_multiplier=3\nmax_temperature_fraction=0.4\n"
         <<"[run]\nseed=17\nmax_mcs=4.5\ncheckpoint_interval_mcs=5.5\nprogress=2\n"
@@ -69,6 +72,7 @@ void test_csv_geometry_and_ini() {
             config.checkpoint_interval_attempts==11,"MCS run interval resolution");
     near(config.progress_interval_seconds,2.0,1e-14,"INI progress interval");
     require(!config.wl.inverse_time_enabled,"INI inverse-time switch");
+    require(config.wl.nalivaiko_mod,"INI Nalivaiko modification switch");
     require(config.wl.initialization_max_attempts==123,"INI initialization attempts");
     near(config.wl.initialization_target_fraction,0.4,1e-14,"INI initialization target");
     near(config.wl.initialization_temperature_fraction,0.07,1e-14,
@@ -97,6 +101,7 @@ void test_csv_geometry_and_ini() {
     const auto progress=wl::parse_arguments(static_cast<int>(progress_argv.size()),progress_argv.data());
     near(progress.progress_interval_seconds,3.0,1e-14,"CLI progress interval");
     require(progress.wl.inverse_time_enabled,"CLI inverse-time switch");
+    require(!progress.wl.nalivaiko_mod,"Nalivaiko modification default");
     std::vector<std::string> no_progress_arguments{"test","--progress","0"};
     std::vector<char*> no_progress_argv; for(auto& argument:no_progress_arguments) no_progress_argv.push_back(argument.data());
     require(wl::parse_arguments(static_cast<int>(no_progress_argv.size()),no_progress_argv.data()).progress_interval_seconds==0.0,
@@ -107,6 +112,27 @@ void test_csv_geometry_and_ini() {
     auto legacy=wl::parse_arguments(static_cast<int>(legacy_argv.size()),legacy_argv.data()); legacy.resolve_mcs(2);
     require(legacy.max_attempts==9&&legacy.max_mcs==4.5&&legacy.uses_legacy_attempt_units(),"legacy attempts compatibility");
     require(config.temperatures.size()==2&&config.output_prefix=="from_ini","INI lists and output");
+    const auto invalid_ini=directory/"invalid.ini";
+    { std::ofstream out(invalid_ini); out<<"[wl]\nnalivaiko_mod=maybe\n"; }
+    std::vector<std::string> invalid_arguments{"test","--config",invalid_ini.string()};
+    std::vector<char*> invalid_argv;
+    for(auto& argument:invalid_arguments) invalid_argv.push_back(argument.data());
+    bool invalid_rejected=false;
+    try { (void)wl::parse_arguments(static_cast<int>(invalid_argv.size()),invalid_argv.data()); }
+    catch(const std::runtime_error&) { invalid_rejected=true; }
+    require(invalid_rejected,"invalid Nalivaiko boolean must be rejected");
+    const auto metadata_path=directory/"metadata.json";
+    const wl::DenseCouplings metadata_couplings(geometry,1.0);
+    wl::write_metadata_json(metadata_path.string(),config,metadata_couplings,
+                            0,0,0,0,0,false,1,1);
+    std::ifstream metadata_input(metadata_path);
+    const std::string metadata((std::istreambuf_iterator<char>(metadata_input)),
+                               std::istreambuf_iterator<char>());
+    metadata_input.close();
+    require(metadata.find("\"nalivaiko_mod\": true")!=std::string::npos&&
+            metadata.find("\"refinement_active_scope\": \"current_iteration\"")!=
+                std::string::npos,
+            "Nalivaiko mode must be recorded in metadata");
     std::filesystem::remove_all(directory);
 }
 
@@ -598,6 +624,69 @@ void test_histogram_statistics() {
     near(late.factor(),2.0/400.0,1e-14,"late walker local 1/t clock");
 }
 
+void test_nalivaiko_refinement_mask() {
+    auto couplings=std::make_shared<wl::DenseCouplings>(
+        wl::Geometry::simple_cubic(1,1,1,1.0,{0,0,1},false),1.0);
+    wl::EnergyGrid grid{-1,1,0.5};
+    wl::WlParameters parameters{0.8,1,1e-8,1,0,false};
+    parameters.nalivaiko_mod=true;
+    wl::WangLandauWalker walker(40,couplings,grid,{0,grid.bins()},parameters,23);
+    auto snapshot=walker.snapshot();
+    std::fill(snapshot.active.begin(),snapshot.active.end(),0);
+    std::fill(snapshot.histogram.begin(),snapshot.histogram.end(),0);
+    snapshot.active[0]=snapshot.active[1]=1;
+    snapshot.histogram[0]=snapshot.histogram[1]=10;
+    walker.restore(snapshot);
+    require(walker.ready_for_iteration(),"Nalivaiko stage must initially satisfy flatness");
+    walker.begin_next_iteration();
+    const auto reset_statistics=walker.histogram_statistics();
+    require(reset_statistics.active_bins==0&&reset_statistics.covered_bins==0,
+            "Nalivaiko refinement mask must reset with histogram");
+    require(walker.active_mask()[0]!=0&&walker.active_mask()[1]!=0,
+            "Nalivaiko reset must preserve cumulative active bins");
+    const std::array<const wl::WangLandauWalker*,1> walkers{&walker};
+    const auto fragment=wl::summarize_walkers({0,grid.bins()},walkers,grid.bins());
+    require(fragment.valid[0]!=0&&fragment.valid[1]!=0,
+            "Nalivaiko reset must preserve DOS validity");
+
+    const auto checkpoint_path=
+        (std::filesystem::temp_directory_path()/"wl_nalivaiko_checkpoint.bin").string();
+    wl::save_checkpoint(checkpoint_path,walker.snapshot());
+    wl::WangLandauWalker restored(40,couplings,grid,{0,grid.bins()},parameters,23);
+    restored.restore(wl::load_checkpoint(checkpoint_path));
+    std::filesystem::remove(checkpoint_path);
+    require(restored.histogram_statistics().active_bins==0,
+            "checkpoint restore must reconstruct an empty refinement mask");
+    require(restored.active_mask()[0]!=0&&restored.active_mask()[1]!=0,
+            "checkpoint restore must preserve cumulative active bins");
+    restored.attempt_flip();
+    const auto next_statistics=restored.histogram_statistics();
+    require(next_statistics.active_bins==1&&next_statistics.covered_bins==1,
+            "new stage visits must rebuild the Nalivaiko refinement mask");
+    require(restored.flat()&&restored.covered(),
+            "flatness and coverage must ignore cumulative bins from earlier stages");
+
+    wl::WlParameters inverse_parameters{0.99,100,1e-8,1};
+    inverse_parameters.nalivaiko_mod=true;
+    wl::WangLandauWalker inverse(41,couplings,grid,{0,grid.bins()},inverse_parameters,29);
+    auto inverse_snapshot=inverse.snapshot();
+    std::fill(inverse_snapshot.active.begin(),inverse_snapshot.active.end(),0);
+    std::fill(inverse_snapshot.histogram.begin(),inverse_snapshot.histogram.end(),0);
+    inverse_snapshot.active[0]=inverse_snapshot.active[1]=1;
+    inverse_snapshot.histogram[0]=inverse_snapshot.histogram[1]=1;
+    inverse_snapshot.attempted=100;
+    inverse_snapshot.factor=0.02;
+    inverse.restore(inverse_snapshot);
+    require(inverse.ready_for_iteration(),"Nalivaiko coverage must permit the 1/t transition");
+    inverse.begin_next_iteration();
+    require(inverse.stage()==wl::RefinementStage::inverse_time,
+            "Nalivaiko walker must enter inverse-time refinement");
+    near(inverse.factor(),2.0/100.0,1e-14,
+         "Nalivaiko 1/t clock must use cumulative active bins");
+    require(inverse.histogram_statistics().active_bins==0,
+            "Nalivaiko refinement mask must also reset on the 1/t transition");
+}
+
 void test_classic_rewl_independence_and_summary() {
     auto couplings=std::make_shared<wl::DenseCouplings>(
         wl::Geometry::simple_cubic(1,1,1,1.0,{0,0,1},false),1.0);
@@ -695,6 +784,7 @@ int main() {
       {"forced_acceptance",test_forced_acceptance},
       {"refinement_transition",test_refinement_transition},
       {"histogram_statistics",test_histogram_statistics},
+      {"nalivaiko_refinement_mask",test_nalivaiko_refinement_mask},
       {"classic_rewl_independence_summary",test_classic_rewl_independence_and_summary},
       {"unlimited_max_attempts",test_unlimited_max_attempts},
       {"exact_thermo",test_exact_enumeration_and_thermo},

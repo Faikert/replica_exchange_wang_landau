@@ -131,6 +131,7 @@ void apply_ini_setting(RunConfig& c,const std::string& section,const std::string
     else if(full=="wl.minimum_visits"||full=="wl.min_visits") c.wl.minimum_visits=number<std::uint64_t>(value,full);
     else if(full=="wl.final_factor") c.wl.final_factor=number<double>(value,full);
     else if(full=="wl.inverse_time") c.wl.inverse_time_enabled=boolean(value,full);
+    else if(full=="wl.nalivaiko_mod") c.wl.nalivaiko_mod=boolean(value,full);
     else if(full=="wl.check_interval") { c.wl.check_interval_attempts=number<std::uint64_t>(value,full); c.check_interval_uses_mcs=false; }
     else if(full=="wl.check_interval_mcs") { c.check_interval_mcs=number<double>(value,full); c.check_interval_uses_mcs=true; }
     else if(full=="wl.force_accept_after") { c.wl.force_accept_after_attempts=number<std::uint64_t>(value,full); c.force_accept_after_uses_mcs=false; }
@@ -470,7 +471,14 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         << ", \"walkers_per_rank\": "<<c.walkers_per_rank<<", \"overlap\": "<<c.overlap
         << ", \"flatness\": "<<c.wl.flatness<<", \"flatness_scope\": \"walker_local\""
         << ", \"initial_refinement_criterion\": \""
-        <<(c.wl.inverse_time_enabled?"full_coverage_of_discovered_bins":"histogram_flatness")<<"\""
+        <<(c.wl.inverse_time_enabled?
+            (c.wl.nalivaiko_mod?"full_coverage_of_current_iteration_bins":
+                                "full_coverage_of_discovered_bins"):
+            (c.wl.nalivaiko_mod?"histogram_flatness_over_current_iteration_bins":
+                                "histogram_flatness"))<<"\""
+        << ", \"nalivaiko_mod\": "<<(c.wl.nalivaiko_mod?"true":"false")
+        << ", \"refinement_active_scope\": \""
+        <<(c.wl.nalivaiko_mod?"current_iteration":"cumulative_discovered_bins")<<"\""
         << ", \"inverse_time_clock\": \"walker_local_attempted_flips/active_bins\""
         << ", \"dos_synchronization\": \"none\""
         << ", \"refinement_schedule\": \"walker_independent\""

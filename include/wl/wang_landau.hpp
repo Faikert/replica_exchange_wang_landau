@@ -52,6 +52,7 @@ struct WlParameters {
     double initialization_max_temperature_fraction{0.5};
     bool collect_window_statistics{false};
     double round_trip_margin_fraction{0.1};
+    bool nalivaiko_mod{false};
 };
 
 enum class RefinementStage : std::uint8_t { wang_landau, inverse_time, frozen };
@@ -149,9 +150,11 @@ private:
     std::vector<double> log_g_;
     std::vector<std::uint64_t> histogram_;
     std::vector<std::uint8_t> active_;
+    std::vector<std::uint8_t> refinement_active_;
     std::vector<double> squared_energy_displacement_;
     std::vector<std::uint64_t> displacement_samples_;
     std::size_t active_bin_count_{};
+    std::size_t refinement_active_bin_count_{};
     double factor_{1.0};
     std::uint64_t attempted_{};
     std::uint64_t accepted_{};

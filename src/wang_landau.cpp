@@ -100,6 +100,7 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
     log_g_.assign(grid_.bins(), 0.0);
     histogram_.assign(grid_.bins(), 0);
     active_.assign(grid_.bins(), 0);
+    if(parameters_.nalivaiko_mod) refinement_active_.assign(grid_.bins(), 0);
     if(parameters_.collect_window_statistics) {
         squared_energy_displacement_.assign(grid_.bins(),0.0);
         displacement_samples_.assign(grid_.bins(),0);
@@ -294,6 +295,10 @@ void WangLandauWalker::update_current_bin() {
         active_[*bin] = 1;
         ++active_bin_count_;
     }
+    if (parameters_.nalivaiko_mod && refinement_active_[*bin] == 0) {
+        refinement_active_[*bin] = 1;
+        ++refinement_active_bin_count_;
+    }
     if (stage_ != RefinementStage::frozen) log_g_[*bin] += factor_;
 }
 
@@ -338,11 +343,13 @@ void WangLandauWalker::update_representatives() {
 
 HistogramStatistics WangLandauWalker::histogram_statistics() const noexcept {
     HistogramStatistics statistics;
+    const auto& refinement_mask=parameters_.nalivaiko_mod?refinement_active_:active_;
+    statistics.active_bins=parameters_.nalivaiko_mod?
+        refinement_active_bin_count_:active_bin_count_;
     long double total = 0.0L;
     statistics.minimum = std::numeric_limits<std::uint64_t>::max();
     for (std::size_t i = window_.begin; i < window_.end; ++i) {
-        if (!active_[i]) continue;
-        ++statistics.active_bins;
+        if (!refinement_mask[i]) continue;
         if(histogram_[i]!=0) ++statistics.covered_bins;
         statistics.minimum = std::min(statistics.minimum, histogram_[i]);
         total += static_cast<long double>(histogram_[i]);
@@ -385,6 +392,11 @@ void WangLandauWalker::begin_next_iteration() {
     factor_ *= 0.5;
     std::fill(histogram_.begin() + static_cast<std::ptrdiff_t>(window_.begin),
               histogram_.begin() + static_cast<std::ptrdiff_t>(window_.end), 0);
+    if(parameters_.nalivaiko_mod) {
+        std::fill(refinement_active_.begin() + static_cast<std::ptrdiff_t>(window_.begin),
+                  refinement_active_.begin() + static_cast<std::ptrdiff_t>(window_.end), 0);
+        refinement_active_bin_count_=0;
+    }
     if(parameters_.inverse_time_enabled) {
         const auto inverse_time = attempted_ == 0 ? 1.0 :
             static_cast<double>(active_bins()) / static_cast<double>(attempted_);
@@ -420,9 +432,16 @@ void WangLandauWalker::restore(const WalkerSnapshot& s) {
     histogram_ = s.histogram; active_ = s.active; factor_ = s.factor;
     attempted_ = s.attempted; accepted_ = s.accepted;
     active_bin_count_=0;
+    if(parameters_.nalivaiko_mod) refinement_active_.assign(grid_.bins(),0);
+    else refinement_active_.clear();
+    refinement_active_bin_count_=0;
     for(std::size_t i=window_.begin;i<window_.end;++i) {
         active_[i]=active_[i]!=0?1:0;
         active_bin_count_+=active_[i];
+        if(parameters_.nalivaiko_mod) {
+            refinement_active_[i]=static_cast<std::uint8_t>(histogram_[i]!=0);
+            refinement_active_bin_count_+=refinement_active_[i];
+        }
     }
     forced_accepted_ = s.forced_accepted; last_accepted_attempt_ = s.last_accepted_attempt; stage_ = s.stage;
     rng_.set_state(s.rng_state);
