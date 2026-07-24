@@ -72,7 +72,19 @@ if(WL_BUILD_TESTS)
               -DWL_RUN=$<TARGET_FILE:wl_run>
               -DGEOMETRY=${CMAKE_SOURCE_DIR}/examples/system_weighted.csv
               -DPREFIX=${CMAKE_CURRENT_BINARY_DIR}/wl_mpi_joint_smoke_output
+              -DRANKS=2 -DWINDOWS=1
               -P ${CMAKE_SOURCE_DIR}/tests/mpi_output_test.cmake)
+    if(NOT MPIEXEC_MAX_NUMPROCS OR MPIEXEC_MAX_NUMPROCS GREATER_EQUAL 4)
+      add_test(NAME wl_mpi_joint_multiwindow_output
+        COMMAND ${CMAKE_COMMAND}
+                -DMPIEXEC=${MPIEXEC_EXECUTABLE}
+                -DNUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}
+                -DWL_RUN=$<TARGET_FILE:wl_run>
+                -DGEOMETRY=${CMAKE_SOURCE_DIR}/examples/system_weighted.csv
+                -DPREFIX=${CMAKE_CURRENT_BINARY_DIR}/wl_mpi_joint_multiwindow_output
+                -DRANKS=4 -DWINDOWS=2
+                -P ${CMAKE_SOURCE_DIR}/tests/mpi_output_test.cmake)
+    endif()
     add_test(NAME wl_mpi_checkpoint_rejected
       COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
               $<TARGET_FILE:wl_run> --smoke-test --checkpoint wl_mpi_forbidden.chk)

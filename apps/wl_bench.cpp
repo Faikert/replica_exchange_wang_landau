@@ -21,7 +21,7 @@ int main(int argc,char** argv) {
         else throw std::invalid_argument("backend must be dense or csr");
         std::vector<std::int8_t> spins(geometry.size(),1);
         auto fields=wl::local_fields(*couplings,spins); wl::Xoshiro256StarStar rng(1); std::uint64_t accepted=0;
-        auto energy=wl::total_energy(*couplings,spins);
+        auto energy=wl::energy_from_fields(spins,fields);
         std::vector<double> q_weights(spins.size(),1.0);
         for(std::size_t i=1;i<q_weights.size();i+=2) q_weights[i]=-1.0;
         const auto order=wl::WeightedOrderParameter::create(q_weights,1.0);

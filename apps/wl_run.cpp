@@ -98,7 +98,7 @@ int main(int argc,char** argv) {
             if(parallel.rank()==0) {
                 std::vector<std::int8_t> spins(geometry.size(),1);
                 auto fields=wl::local_fields(*couplings,spins);
-                auto energy=wl::total_energy(*couplings,spins);
+                auto energy=wl::energy_from_fields(spins,fields);
                 auto minimum=energy,maximum=energy; wl::Xoshiro256StarStar rng(config.seed);
                 for(std::uint64_t step=0;step<config.max_attempts;++step) {
                     const auto i=static_cast<std::size_t>(rng.bounded(spins.size()));

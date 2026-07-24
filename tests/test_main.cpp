@@ -143,6 +143,10 @@ void test_backends_and_incremental_fields() {
         near(dense.at(i,j),csr.at(i,j),1e-14,"dense/csr mismatch");
     std::vector<std::int8_t> spins{1,-1,1,1,-1,-1}; auto fields=wl::local_fields(dense,spins);
     const auto initial=wl::total_energy(dense,spins);
+    const auto csr_fields=wl::local_fields(csr,spins);
+    require(fields==csr_fields,"dense/CSR backend-specific fields must be bitwise equal");
+    require(wl::energy_from_fields(spins,fields)==initial,
+            "energy_from_fields must reuse the exact computed field");
     for(std::size_t i=0;i<spins.size();++i) {
         const auto old=spins[i]; const auto delta=wl::flip_delta(i,spins,fields);
         dense.add_flip_delta(i,old,fields); spins[i]=-old;
@@ -1020,6 +1024,23 @@ void test_classic_rewl_independence_and_summary() {
             first.stage()==first_estimator.stage&&second.log_g()==second_estimator.log_g&&
             second.factor()==second_estimator.factor&&second.stage()==second_estimator.stage,
             "replica exchange must preserve both DOS estimators and stages");
+
+    const auto local_before=first.snapshot();
+    const auto remote_configuration=second.snapshot();
+    std::vector<std::int8_t> exchange_spins=remote_configuration.spins;
+    std::vector<double> exchange_fields=remote_configuration.fields;
+    first.swap_configuration_buffers(exchange_spins,exchange_fields,
+                                     remote_configuration.energy,
+                                     remote_configuration.order_parameter);
+    require(std::equal(first.spins().begin(),first.spins().end(),
+                       remote_configuration.spins.begin())&&
+            std::equal(first.fields().begin(),first.fields().end(),
+                       remote_configuration.fields.begin()),
+            "buffer exchange installs the remote configuration");
+    require(exchange_spins==local_before.spins&&exchange_fields==local_before.fields,
+            "buffer exchange retains the old configuration for reuse");
+    require(first.energy_bin()==grid.index(remote_configuration.energy),
+            "buffer exchange refreshes the cached energy bin");
 
     second_snapshot=second.snapshot();
     std::fill(second_snapshot.active.begin(),second_snapshot.active.end(),0);

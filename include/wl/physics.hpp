@@ -44,6 +44,8 @@ public:
     virtual ~Couplings() = default;
     [[nodiscard]] virtual std::size_t size() const noexcept = 0;
     [[nodiscard]] virtual double at(std::size_t i, std::size_t j) const noexcept = 0;
+    virtual void compute_fields(std::span<const std::int8_t> spins,
+                                std::span<double> fields) const = 0;
     virtual void add_flip_delta(std::size_t flipped, std::int8_t old_spin,
                                 std::span<double> fields) const = 0;
     [[nodiscard]] virtual std::string backend_name() const = 0;
@@ -54,6 +56,8 @@ public:
     DenseCouplings(const Geometry& geometry, double coupling_scale);
     [[nodiscard]] std::size_t size() const noexcept override { return n_; }
     [[nodiscard]] double at(std::size_t i, std::size_t j) const noexcept override;
+    void compute_fields(std::span<const std::int8_t> spins,
+                        std::span<double> fields) const override;
     void add_flip_delta(std::size_t flipped, std::int8_t old_spin,
                         std::span<double> fields) const override;
     [[nodiscard]] std::string backend_name() const override { return "dense"; }
@@ -67,6 +71,8 @@ public:
     CsrCouplings(const Geometry& geometry, double coupling_scale, double cutoff);
     [[nodiscard]] std::size_t size() const noexcept override { return n_; }
     [[nodiscard]] double at(std::size_t i, std::size_t j) const noexcept override;
+    void compute_fields(std::span<const std::int8_t> spins,
+                        std::span<double> fields) const override;
     void add_flip_delta(std::size_t flipped, std::int8_t old_spin,
                         std::span<double> fields) const override;
     [[nodiscard]] std::string backend_name() const override { return "csr"; }
@@ -81,6 +87,8 @@ private:
                                                 std::span<const std::int8_t> spins);
 [[nodiscard]] double total_energy(const Couplings& couplings,
                                   std::span<const std::int8_t> spins);
+[[nodiscard]] double energy_from_fields(std::span<const std::int8_t> spins,
+                                        std::span<const double> fields);
 [[nodiscard]] double flip_delta(std::size_t i, std::span<const std::int8_t> spins,
                                 std::span<const double> fields);
 

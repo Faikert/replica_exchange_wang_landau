@@ -165,7 +165,9 @@ public:
     [[nodiscard]] double energy() const noexcept { return energy_; }
     [[nodiscard]] double order_parameter() const noexcept { return order_parameter_value_; }
     [[nodiscard]] const DosGrid& dos_grid() const noexcept { return dos_grid_; }
-    [[nodiscard]] std::optional<std::size_t> energy_bin() const noexcept { return grid_.index(energy_); }
+    [[nodiscard]] std::optional<std::size_t> energy_bin() const noexcept {
+        return current_location_valid_?std::optional<std::size_t>(current_energy_bin_):std::nullopt;
+    }
     [[nodiscard]] RefinementStage stage() const noexcept { return stage_; }
     [[nodiscard]] double factor() const noexcept { return factor_; }
     [[nodiscard]] const EnergyWindow& window() const noexcept { return window_; }
@@ -194,6 +196,9 @@ public:
     void replace_configuration(std::span<const std::int8_t> spins,
                                std::span<const double> fields, double energy,
                                double order_parameter = 0.0);
+    void swap_configuration_buffers(std::vector<std::int8_t>& spins,
+                                    std::vector<double>& fields, double energy,
+                                    double order_parameter = 0.0);
     void swap_configuration(WangLandauWalker& other);
     [[nodiscard]] double exchange_log_probability(const WangLandauWalker& other) const;
 
@@ -213,11 +218,21 @@ private:
     std::vector<double> log_g_;
     std::vector<std::uint64_t> histogram_;
     std::vector<std::uint8_t> active_;
-    std::vector<std::uint8_t> refinement_active_;
+    std::vector<std::size_t> active_cells_;
+    std::vector<std::size_t> iteration_cells_;
+    std::uint64_t histogram_sum_{};
+    std::uint64_t active_histogram_sum_{};
     std::vector<double> squared_energy_displacement_;
     std::vector<std::uint64_t> displacement_samples_;
+    std::size_t energy_bin_count_{};
+    std::size_t q_bin_count_{1};
+    double inverse_energy_width_{};
+    double inverse_q_width_{};
+    std::size_t current_energy_bin_{};
+    std::size_t current_q_bin_{};
+    std::size_t current_cell_{};
+    bool current_location_valid_{false};
     std::size_t active_bin_count_{};
-    std::size_t refinement_active_bin_count_{};
     double factor_{1.0};
     std::uint64_t attempted_{};
     std::uint64_t accepted_{};
@@ -231,6 +246,15 @@ private:
     std::vector<double> representative_distances_;
     std::vector<EnergyRepresentative> representatives_;
 
+    struct StateLocation {
+        std::size_t energy_bin{};
+        std::size_t q_bin{};
+        std::size_t cell{};
+    };
+    [[nodiscard]] std::optional<StateLocation> locate_state(
+        double energy, double order_parameter) const noexcept;
+    void set_current_location(const StateLocation& location) noexcept;
+    void refresh_current_location();
     void update_current_bin();
     [[nodiscard]] std::optional<std::size_t> current_cell() const noexcept;
     [[nodiscard]] std::size_t active_bins() const noexcept;

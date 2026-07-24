@@ -204,11 +204,27 @@ double DenseCouplings::at(std::size_t i, std::size_t j) const noexcept {
     return matrix_[i*n_ + j];
 }
 
+void DenseCouplings::compute_fields(std::span<const std::int8_t> spins,
+                                    std::span<double> fields) const {
+    if(spins.size()!=n_||fields.size()!=n_)
+        throw std::invalid_argument("Dense field size mismatch");
+    #pragma omp parallel for schedule(static)
+    for(std::int64_t ii=0;ii<static_cast<std::int64_t>(n_);++ii) {
+        const auto i=static_cast<std::size_t>(ii);
+        const auto* row=matrix_.data()+i*n_;
+        double sum=0.0;
+        for(std::size_t j=0;j<n_;++j)
+            sum+=row[j]*static_cast<double>(spins[j]);
+        fields[i]=sum;
+    }
+}
+
 void DenseCouplings::add_flip_delta(std::size_t flipped, std::int8_t old_spin,
                                     std::span<double> fields) const {
     const auto multiplier = -2.0 * static_cast<double>(old_spin);
+    const auto* row=matrix_.data()+flipped*n_;
     for (std::size_t j = 0; j < n_; ++j)
-        fields[j] += multiplier * matrix_[j*n_ + flipped];
+        fields[j] += multiplier * row[j];
 }
 
 CsrCouplings::CsrCouplings(const Geometry& geometry, double scale, double cutoff)
@@ -245,6 +261,20 @@ double CsrCouplings::at(std::size_t i, std::size_t j) const noexcept {
     return 0.0;
 }
 
+void CsrCouplings::compute_fields(std::span<const std::int8_t> spins,
+                                  std::span<double> fields) const {
+    if(spins.size()!=n_||fields.size()!=n_)
+        throw std::invalid_argument("CSR field size mismatch");
+    #pragma omp parallel for schedule(static)
+    for(std::int64_t ii=0;ii<static_cast<std::int64_t>(n_);++ii) {
+        const auto i=static_cast<std::size_t>(ii);
+        double sum=0.0;
+        for(auto k=offsets_[i];k<offsets_[i+1];++k)
+            sum+=values_[k]*static_cast<double>(spins[neighbors_[k]]);
+        fields[i]=sum;
+    }
+}
+
 void CsrCouplings::add_flip_delta(std::size_t flipped, std::int8_t old_spin,
                                   std::span<double> fields) const {
     const auto multiplier = -2.0 * static_cast<double>(old_spin);
@@ -256,19 +286,18 @@ std::vector<double> local_fields(const Couplings& couplings,
                                  std::span<const std::int8_t> spins) {
     if (couplings.size() != spins.size()) throw std::invalid_argument("Spin count mismatch");
     std::vector<double> result(spins.size(), 0.0);
-    #pragma omp parallel for schedule(static)
-    for (std::int64_t ii = 0; ii < static_cast<std::int64_t>(spins.size()); ++ii) {
-        const auto i = static_cast<std::size_t>(ii);
-        double sum = 0.0;
-        for (std::size_t j = 0; j < spins.size(); ++j)
-            sum += couplings.at(i, j) * static_cast<double>(spins[j]);
-        result[i] = sum;
-    }
+    couplings.compute_fields(spins,result);
     return result;
 }
 
 double total_energy(const Couplings& couplings, std::span<const std::int8_t> spins) {
     const auto fields = local_fields(couplings, spins);
+    return energy_from_fields(spins,fields);
+}
+
+double energy_from_fields(std::span<const std::int8_t> spins,
+                          std::span<const double> fields) {
+    if(spins.size()!=fields.size()) throw std::invalid_argument("Spin/field size mismatch");
     double energy = 0.0;
     for (std::size_t i = 0; i < spins.size(); ++i)
         energy += 0.5 * static_cast<double>(spins[i]) * fields[i];

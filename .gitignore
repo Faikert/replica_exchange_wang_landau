@@ -13,3 +13,4 @@
 !/examples/*.ini
 start.sh
 Testing*/
+*.tgz
