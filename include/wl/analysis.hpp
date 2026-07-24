@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <span>
 #include <vector>
 
@@ -15,7 +16,9 @@ struct DosFragment {
     std::vector<std::uint64_t> histogram;
     std::vector<double> standard_error;
     std::vector<std::uint8_t> valid;
-    DosGrid grid;
+    DosGrid grid{};
+    std::vector<std::uint32_t> contributors;
+    std::vector<std::int32_t> support_component;
 };
 
 struct WindowSamplingStatistics {
@@ -55,7 +58,17 @@ struct JointDensityOfStates {
     std::vector<std::uint64_t> histogram;
     std::vector<double> standard_error;
     std::vector<std::uint8_t> valid;
+    std::vector<std::uint32_t> contributors;
+    std::vector<std::int32_t> support_component;
     bool fully_normalized{false};
+};
+
+class DisconnectedSupportError : public std::runtime_error {
+public:
+    explicit DisconnectedSupportError(std::size_t components);
+    [[nodiscard]] std::size_t components() const noexcept { return components_; }
+private:
+    std::size_t components_{};
 };
 
 struct OrderParameterThermodynamicPoint {
@@ -95,6 +108,7 @@ struct ThermodynamicPoint {
     bool converged, std::size_t spin_count, double normalization);
 [[nodiscard]] DensityOfStates marginalize(const JointDensityOfStates& joint);
 [[nodiscard]] DosFragment marginalize_fragment(const DosFragment& joint);
+[[nodiscard]] std::size_t support_component_count(const DosFragment& fragment);
 [[nodiscard]] std::vector<OrderParameterThermodynamicPoint> order_parameter_thermodynamics(
     const JointDensityOfStates& dos, std::span<const double> temperatures,
     std::size_t spin_count, double boltzmann_constant = 1.0);

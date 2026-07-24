@@ -531,6 +531,148 @@ void test_joint_dos_and_order_parameter() {
     std::filesystem::remove_all(directory);
 }
 
+void test_joint_relaxed_union_and_guards() {
+    auto couplings=std::make_shared<wl::DenseCouplings>(
+        wl::Geometry::simple_cubic(1,1,1,1.0,{0,0,1},false),1.0);
+    const auto order_value=wl::WeightedOrderParameter::create({1.0},1.0);
+    auto order=std::make_shared<const wl::WeightedOrderParameter>(order_value);
+    const wl::DosGrid grid{{-1.0,1.0,1.0},order->grid};
+    const wl::EnergyWindow window{0,grid.energy_bins()};
+    wl::WlParameters parameters{0.8,1,1e-8,1};
+    wl::WangLandauWalker first(101,couplings,grid,window,parameters,5,order);
+    wl::WangLandauWalker second(102,couplings,grid,window,parameters,5,order);
+    wl::WangLandauWalker third(103,couplings,grid,window,parameters,5,order);
+    const std::array<std::size_t,4> cells{
+        grid.flatten(0,0),grid.flatten(0,1),grid.flatten(1,1),grid.flatten(1,2)};
+    const std::array<double,4> base{0.0,1.0,2.0,3.0};
+    const auto prepare=[&](wl::WangLandauWalker& walker,double offset,
+                           std::initializer_list<std::size_t> active_cells) {
+        auto state=walker.snapshot();
+        std::fill(state.active.begin(),state.active.end(),0);
+        std::fill(state.histogram.begin(),state.histogram.end(),0);
+        std::fill(state.log_g.begin(),state.log_g.end(),offset);
+        for(std::size_t i=0;i<cells.size();++i) state.log_g[cells[i]]=base[i]+offset;
+        for(const auto cell:active_cells) { state.active[cell]=1; state.histogram[cell]=10; }
+        walker.restore(state);
+    };
+    prepare(first,10.0,{cells[0],cells[1]});
+    prepare(second,-4.0,{cells[1],cells[2]});
+    prepare(third,7.0,{cells[2],cells[3]});
+    const std::array<const wl::WangLandauWalker*,3> walkers{&first,&second,&third};
+    const auto fragment=wl::summarize_walkers(window,walkers,grid.energy_bins());
+    require(fragment.valid[cells[0]]&&fragment.valid[cells[3]],
+            "relaxed union retains cells visited by one walker");
+    require(fragment.contributors[cells[0]]==1&&fragment.contributors[cells[1]]==2&&
+            fragment.contributors[cells[2]]==2&&fragment.contributors[cells[3]]==1,
+            "relaxed union contributor counts");
+    require(fragment.support_component[cells[0]]==fragment.support_component[cells[3]],
+            "chain overlap creates one support component");
+    near(fragment.log_g[cells[1]]-fragment.log_g[cells[0]],1.0,1e-13,
+         "weighted alignment preserves first DOS difference");
+    near(fragment.log_g[cells[3]]-fragment.log_g[cells[2]],1.0,1e-13,
+         "weighted alignment propagates through overlap chain");
+    const auto stitched=wl::stitch_joint_dos(grid,std::span(&fragment,1),false,false,1,
+                                              order->normalization);
+    require(stitched.contributors[cells[1]]==2&&stitched.support_component[cells[3]]==0,
+            "connected relaxed union stitches successfully");
+
+    const wl::DosGrid window_grid{{-2.0,2.0,1.0},order->grid};
+    const auto make_fragment=[&](wl::EnergyWindow energy_window) {
+        const auto count=window_grid.cells();
+        return wl::DosFragment{energy_window,
+            std::vector<double>(count,std::numeric_limits<double>::quiet_NaN()),
+            std::vector<std::uint64_t>(count,0),
+            std::vector<double>(count,std::numeric_limits<double>::quiet_NaN()),
+            std::vector<std::uint8_t>(count,0),window_grid,
+            std::vector<std::uint32_t>(count,0),std::vector<std::int32_t>(count,-1)};
+    };
+    auto left_fragment=make_fragment({0,3});
+    auto right_fragment=make_fragment({1,4});
+    const auto left_only=window_grid.flatten(0,1);
+    const auto shared=window_grid.flatten(1,1);
+    const auto right_only=window_grid.flatten(3,1);
+    const auto set_cell=[](wl::DosFragment& value,std::size_t cell,double log_g) {
+        value.valid[cell]=1; value.log_g[cell]=log_g; value.histogram[cell]=10;
+        value.standard_error[cell]=0.1; value.contributors[cell]=1;
+        value.support_component[cell]=0;
+    };
+    set_cell(left_fragment,left_only,2.0); set_cell(left_fragment,shared,3.0);
+    set_cell(right_fragment,shared,-4.0); set_cell(right_fragment,right_only,-2.0);
+    const std::array<wl::DosFragment,2> window_fragments{left_fragment,right_fragment};
+    const auto across_windows=wl::stitch_joint_dos(window_grid,window_fragments,false,false,1,
+                                                    order->normalization);
+    require(across_windows.valid[left_only]&&across_windows.valid[right_only],
+            "support connected through an adjacent window is retained");
+    near(across_windows.log_g[right_only]-across_windows.log_g[shared],2.0,1e-13,
+         "inter-window weighted shift preserves the right DOS shape");
+
+    wl::WangLandauWalker isolated(104,couplings,grid,window,parameters,5,order);
+    prepare(isolated,2.0,{cells[3]});
+    const std::array<const wl::WangLandauWalker*,2> disconnected_walkers{&first,&isolated};
+    const auto disconnected=wl::summarize_walkers(window,disconnected_walkers,
+                                                   grid.energy_bins());
+    bool disconnected_rejected=false;
+    try { (void)wl::stitch_joint_dos(grid,std::span(&disconnected,1),false,false,1,
+                                     order->normalization); }
+    catch(const wl::DisconnectedSupportError& error) {
+        disconnected_rejected=error.components()==2;
+    }
+    require(disconnected_rejected,"disconnected support cannot receive an arbitrary global shift");
+
+    const auto before=first.snapshot();
+    auto corrupt=before; corrupt.fields[0]+=1.0;
+    bool corrupt_rejected=false;
+    try { first.restore(corrupt); } catch(const std::runtime_error&) { corrupt_rejected=true; }
+    const auto after=first.snapshot();
+    require(corrupt_rejected&&after.spins==before.spins&&after.fields==before.fields&&
+            after.log_g==before.log_g&&after.histogram==before.histogram&&
+            after.rng_state==before.rng_state,"failed restore is transactional");
+    corrupt=before; corrupt.last_new_cell_attempt=corrupt.attempted+1;
+    corrupt_rejected=false;
+    try { first.restore(corrupt); } catch(const std::invalid_argument&) { corrupt_rejected=true; }
+    require(corrupt_rejected,"checkpoint rejects a future last-new-cell clock");
+    corrupt=before; corrupt.energy_grid.width=0.5;
+    corrupt_rejected=false;
+    try { first.restore(corrupt); } catch(const std::invalid_argument&) { corrupt_rejected=true; }
+    require(corrupt_rejected,"checkpoint rejects a different energy layout");
+    corrupt=before; corrupt.order_weights[0]=-corrupt.order_weights[0];
+    corrupt_rejected=false;
+    try { first.restore(corrupt); } catch(const std::invalid_argument&) { corrupt_rejected=true; }
+    require(corrupt_rejected,"checkpoint rejects different order-parameter weights");
+    corrupt=before; corrupt.format_version=4;
+    corrupt_rejected=false;
+    try { first.restore(corrupt); } catch(const std::invalid_argument&) { corrupt_rejected=true; }
+    require(corrupt_rejected,"legacy joint checkpoint is rejected");
+
+    const auto edge_order=wl::WeightedOrderParameter::create({1.5000000000005},1.0);
+    require(edge_order.grid.index(edge_order.normalization)&&
+            edge_order.grid.index(-edge_order.normalization),
+            "Q grid includes extrema just above a half-integer ratio");
+
+    wl::DosFragment structural{{0,grid.energy_bins()},
+        std::vector<double>(grid.cells(),-std::numeric_limits<double>::infinity()),
+        std::vector<std::uint64_t>(grid.cells(),0),std::vector<double>(grid.cells(),0.0),
+        std::vector<std::uint8_t>(grid.cells(),1),grid,{}, {}};
+    const auto structural_marginal=wl::marginalize_fragment(structural);
+    require(std::all_of(structural_marginal.valid.begin(),structural_marginal.valid.end(),
+                        [](auto value){return value!=0;})&&
+            std::all_of(structural_marginal.log_g.begin(),structural_marginal.log_g.end(),
+                        [](double value){return std::isinf(value)&&value<0.0;}),
+            "known joint structural zeros remain known after marginalization");
+
+    bool exact_rejected=false;
+    try { (void)wl::exact_enumeration(*couplings,wl::EnergyGrid{1.0,2.0,0.5}); }
+    catch(const std::runtime_error&) { exact_rejected=true; }
+    require(exact_rejected,"exact enumeration rejects states outside the energy grid");
+
+    wl::RunConfig invalid_temperature;
+    invalid_temperature.temperatures={1.0,-1.0};
+    bool temperature_rejected=false;
+    try { invalid_temperature.validate(false); }
+    catch(const std::invalid_argument&) { temperature_rejected=true; }
+    require(temperature_rejected,"invalid temperatures are rejected before sampling");
+}
+
 void test_adaptive_energy_windows() {
     wl::EnergyGrid grid{-10.0,10.0,0.5};
     const auto initial=wl::partition_windows(grid.bins(),4,0.5);
@@ -539,7 +681,7 @@ void test_adaptive_energy_windows() {
     for(const auto window:initial) {
         wl::DosFragment fragment{window,std::vector<double>(grid.bins(),0.0),
             std::vector<std::uint64_t>(grid.bins(),0),std::vector<double>(grid.bins(),0.0),
-            std::vector<std::uint8_t>(grid.bins(),0)};
+            std::vector<std::uint8_t>(grid.bins(),0),wl::DosGrid{grid,std::nullopt},{},{}};
         wl::WindowSamplingStatistics statistics{window,std::vector<double>(grid.bins(),0.0),
             std::vector<std::uint64_t>(grid.bins(),0),0,1};
         for(std::size_t i=window.begin;i<window.end;++i) {
@@ -574,7 +716,8 @@ void test_adaptive_energy_windows() {
         wl::DosFragment fragment{window,std::vector<double>(fine_grid.bins(),0.0),
             std::vector<std::uint64_t>(fine_grid.bins(),0),
             std::vector<double>(fine_grid.bins(),0.0),
-            std::vector<std::uint8_t>(fine_grid.bins(),0)};
+            std::vector<std::uint8_t>(fine_grid.bins(),0),
+            wl::DosGrid{fine_grid,std::nullopt},{},{}};
         wl::WindowSamplingStatistics statistics{window,
             std::vector<double>(fine_grid.bins(),0.0),
             std::vector<std::uint64_t>(fine_grid.bins(),0),0,1};
@@ -903,6 +1046,7 @@ int main() {
       {"unlimited_max_attempts",test_unlimited_max_attempts},
       {"exact_thermo",test_exact_enumeration_and_thermo},
       {"joint_dos_order_parameter",test_joint_dos_and_order_parameter},
+      {"joint_relaxed_union_guards",test_joint_relaxed_union_and_guards},
       {"adaptive_energy_windows",test_adaptive_energy_windows}};
     int failed=0;
     for(const auto& [name,test]:tests) try { test(); std::cout<<"PASS "<<name<<'\n'; }

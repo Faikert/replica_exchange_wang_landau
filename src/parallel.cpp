@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <stdexcept>
@@ -20,15 +21,154 @@
 namespace wl {
 namespace {
 
+struct EstimatorView {
+    std::span<const double> log_g;
+    std::span<const std::uint64_t> histogram;
+    std::span<const std::uint8_t> active;
+};
+
+struct AlignmentEdge {
+    std::size_t first{},second{};
+    long double weight{},difference{};
+};
+
+struct AlignmentSolution {
+    std::vector<double> shifts;
+    std::vector<std::int32_t> component;
+    std::size_t components{};
+};
+
+AlignmentSolution solve_alignment(std::span<const EstimatorView> estimators,
+                                  std::size_t begin,std::size_t end) {
+    const auto count=estimators.size();
+    std::vector<AlignmentEdge> edges;
+    std::vector<std::vector<std::size_t>> adjacency(count);
+    for(std::size_t a=0;a<count;++a) for(std::size_t b=a+1;b<count;++b) {
+        long double weight=0.0L,difference=0.0L;
+        for(std::size_t cell=begin;cell<end;++cell)
+            if(estimators[a].active[cell]&&estimators[b].active[cell]&&
+               std::isfinite(estimators[a].log_g[cell])&&
+               std::isfinite(estimators[b].log_g[cell])) {
+                const auto w=1.0L+static_cast<long double>(std::min(
+                    estimators[a].histogram[cell],estimators[b].histogram[cell]));
+                weight+=w;
+                difference+=w*static_cast<long double>(
+                    estimators[a].log_g[cell]-estimators[b].log_g[cell]);
+            }
+        if(weight>0.0L) {
+            edges.push_back({a,b,weight,difference/weight});
+            adjacency[a].push_back(b); adjacency[b].push_back(a);
+        }
+    }
+
+    AlignmentSolution result{std::vector<double>(count,0.0),
+        std::vector<std::int32_t>(count,-1),0};
+    for(std::size_t seed=0;seed<count;++seed) if(result.component[seed]<0) {
+        const auto component=static_cast<std::int32_t>(result.components++);
+        std::vector<std::size_t> nodes;
+        std::queue<std::size_t> pending; pending.push(seed); result.component[seed]=component;
+        while(!pending.empty()) {
+            const auto node=pending.front(); pending.pop(); nodes.push_back(node);
+            for(const auto other:adjacency[node]) if(result.component[other]<0) {
+                result.component[other]=component; pending.push(other);
+            }
+        }
+        if(nodes.size()==1) continue;
+        std::vector<std::size_t> equation(count,std::numeric_limits<std::size_t>::max());
+        for(std::size_t i=1;i<nodes.size();++i) equation[nodes[i]]=i-1;
+        const auto unknowns=nodes.size()-1;
+        std::vector<long double> matrix(unknowns*(unknowns+1),0.0L);
+        const auto add=[&](std::size_t row,std::size_t column,long double value) {
+            if(row!=std::numeric_limits<std::size_t>::max()&&
+               column!=std::numeric_limits<std::size_t>::max())
+                matrix[row*(unknowns+1)+column]+=value;
+        };
+        for(const auto& edge:edges) if(result.component[edge.first]==component&&
+                                        result.component[edge.second]==component) {
+            const auto a=equation[edge.first],b=equation[edge.second];
+            add(a,a,edge.weight); add(b,b,edge.weight);
+            add(a,b,-edge.weight); add(b,a,-edge.weight);
+            if(a!=std::numeric_limits<std::size_t>::max())
+                matrix[a*(unknowns+1)+unknowns]-=edge.weight*edge.difference;
+            if(b!=std::numeric_limits<std::size_t>::max())
+                matrix[b*(unknowns+1)+unknowns]+=edge.weight*edge.difference;
+        }
+        for(std::size_t column=0;column<unknowns;++column) {
+            auto pivot=column;
+            for(std::size_t row=column+1;row<unknowns;++row)
+                if(std::abs(matrix[row*(unknowns+1)+column])>
+                   std::abs(matrix[pivot*(unknowns+1)+column])) pivot=row;
+            if(!(std::abs(matrix[pivot*(unknowns+1)+column])>0.0L))
+                throw std::runtime_error("Singular joint-DOS alignment system");
+            if(pivot!=column) for(std::size_t j=column;j<=unknowns;++j)
+                std::swap(matrix[pivot*(unknowns+1)+j],matrix[column*(unknowns+1)+j]);
+            const auto divisor=matrix[column*(unknowns+1)+column];
+            for(std::size_t j=column;j<=unknowns;++j)
+                matrix[column*(unknowns+1)+j]/=divisor;
+            for(std::size_t row=0;row<unknowns;++row) if(row!=column) {
+                const auto multiplier=matrix[row*(unknowns+1)+column];
+                for(std::size_t j=column;j<=unknowns;++j)
+                    matrix[row*(unknowns+1)+j]-=multiplier*matrix[column*(unknowns+1)+j];
+            }
+        }
+        for(std::size_t i=1;i<nodes.size();++i)
+            result.shifts[nodes[i]]=static_cast<double>(matrix[(i-1)*(unknowns+1)+unknowns]);
+    }
+    return result;
+}
+
+DosFragment summarize_joint_union(EnergyWindow window,const DosGrid& layout,
+                                  std::span<const EstimatorView> estimators) {
+    const auto cells=layout.cells();
+    const auto nan=std::numeric_limits<double>::quiet_NaN();
+    DosFragment result{window,std::vector<double>(cells,nan),
+        std::vector<std::uint64_t>(cells,0),std::vector<double>(cells,nan),
+        std::vector<std::uint8_t>(cells,0),layout,std::vector<std::uint32_t>(cells,0),
+        std::vector<std::int32_t>(cells,-1)};
+    const auto begin=layout.flatten(window.begin),end=layout.flatten(window.end);
+    const auto alignment=solve_alignment(estimators,begin,end);
+    for(std::size_t cell=begin;cell<end;++cell) {
+        long double sum=0.0L;
+        for(std::size_t w=0;w<estimators.size();++w) if(estimators[w].active[cell]) {
+            sum+=static_cast<long double>(estimators[w].log_g[cell]+alignment.shifts[w]);
+            result.histogram[cell]+=estimators[w].histogram[cell];
+            ++result.contributors[cell];
+            result.support_component[cell]=alignment.component[w];
+        }
+        if(result.contributors[cell]==0) continue;
+        result.valid[cell]=1;
+        result.log_g[cell]=static_cast<double>(sum/result.contributors[cell]);
+        if(result.contributors[cell]>1) {
+            long double squared=0.0L;
+            for(std::size_t w=0;w<estimators.size();++w) if(estimators[w].active[cell]) {
+                const auto delta=estimators[w].log_g[cell]+alignment.shifts[w]-result.log_g[cell];
+                squared+=static_cast<long double>(delta)*delta;
+            }
+            result.standard_error[cell]=std::sqrt(static_cast<double>(squared/
+                (static_cast<long double>(result.contributors[cell])*
+                 static_cast<long double>(result.contributors[cell]-1))));
+        }
+    }
+    return result;
+}
+
 DosFragment summarize_impl(EnergyWindow window,
                            std::span<const WangLandauWalker* const> walkers,std::size_t bins,
                            bool allow_empty_intersection) {
+    (void)bins;
     const auto nan=std::numeric_limits<double>::quiet_NaN();
     const auto layout=walkers.front()->dos_grid();
+    if(layout.joint()) {
+        std::vector<EstimatorView> estimators;
+        estimators.reserve(walkers.size());
+        for(const auto* walker:walkers)
+            estimators.push_back({walker->log_g(),walker->histogram(),walker->active_mask()});
+        return summarize_joint_union(window,layout,estimators);
+    }
     const auto cells=layout.cells();
     DosFragment f{window,std::vector<double>(cells,nan),std::vector<std::uint64_t>(cells,0),
-                  std::vector<double>(cells,nan),std::vector<std::uint8_t>(cells,0)};
-    f.grid=layout;
+                  std::vector<double>(cells,nan),std::vector<std::uint8_t>(cells,0),
+                  layout,{},{}};
     const auto begin=layout.flatten(window.begin),end=layout.flatten(window.end);
     for(std::size_t i=begin;i<end;++i) {
         bool valid=true;
@@ -93,16 +233,172 @@ void allreduce_chunks(const T* input,T* output,std::size_t count,MPI_Datatype ty
     }
 }
 
+template<class T>
+void gather_chunks(const T* input,std::vector<T>& output,std::size_t count,
+                   MPI_Datatype type,int root,MPI_Comm communicator) {
+    int rank=0,size=1;
+    MPI_Comm_rank(communicator,&rank);
+    MPI_Comm_size(communicator,&size);
+    const auto ranks=static_cast<std::size_t>(size);
+    if(count!=0&&ranks>std::numeric_limits<std::size_t>::max()/count)
+        throw std::overflow_error("MPI gathered DOS size overflows size_t");
+    if(rank==root) {
+        output.resize(count*ranks);
+    }
+    constexpr std::size_t maximum=1'000'000;
+    for(std::size_t offset=0;offset<count;) {
+        const auto chunk=std::min(maximum,count-offset);
+        std::vector<T> received;
+        if(rank==root) received.resize(chunk*static_cast<std::size_t>(size));
+        MPI_Gather(input+offset,static_cast<int>(chunk),type,
+                   rank==root?received.data():nullptr,static_cast<int>(chunk),type,
+                   root,communicator);
+        if(rank==root)
+            for(int source=0;source<size;++source)
+                std::copy_n(received.begin()+static_cast<std::ptrdiff_t>(
+                                static_cast<std::size_t>(source)*chunk),chunk,
+                            output.begin()+static_cast<std::ptrdiff_t>(
+                                static_cast<std::size_t>(source)*count+offset));
+        offset+=chunk;
+    }
+}
+
+template<class T>
+void broadcast_chunks(T* values,std::size_t count,MPI_Datatype type,int root,
+                      MPI_Comm communicator) {
+    constexpr auto maximum=static_cast<std::size_t>(std::numeric_limits<int>::max());
+    for(std::size_t offset=0;offset<count;) {
+        const auto chunk=std::min(maximum,count-offset);
+        MPI_Bcast(values+offset,static_cast<int>(chunk),type,root,communicator);
+        offset+=chunk;
+    }
+}
+
+template<class T>
+void sendrecv_chunks(const T* send,T* receive,std::size_t count,MPI_Datatype type,
+                     int partner,int tag,MPI_Comm communicator) {
+    constexpr auto maximum=static_cast<std::size_t>(std::numeric_limits<int>::max());
+    for(std::size_t offset=0;offset<count;) {
+        const auto chunk=std::min(maximum,count-offset);
+        MPI_Sendrecv(send+offset,static_cast<int>(chunk),type,partner,tag,
+                     receive+offset,static_cast<int>(chunk),type,partner,tag,
+                     communicator,MPI_STATUS_IGNORE);
+        offset+=chunk;
+    }
+}
+
+template<class T>
+std::vector<std::uint64_t> gather_variable_chunks(
+    const T* input,std::size_t count,std::vector<T>& output,MPI_Datatype type,
+    int root,int tag,MPI_Comm communicator) {
+    int rank=0,size=1;
+    MPI_Comm_rank(communicator,&rank); MPI_Comm_size(communicator,&size);
+    const auto local_count=static_cast<std::uint64_t>(count);
+    std::vector<std::uint64_t> counts;
+    if(rank==root) counts.resize(static_cast<std::size_t>(size));
+    MPI_Gather(&local_count,1,MPI_UINT64_T,rank==root?counts.data():nullptr,1,
+               MPI_UINT64_T,root,communicator);
+    std::vector<std::size_t> offsets;
+    int valid_layout=1;
+    if(rank==root) {
+        offsets.resize(static_cast<std::size_t>(size));
+        std::size_t total=0;
+        for(int source=0;source<size;++source) {
+            offsets[static_cast<std::size_t>(source)]=total;
+            const auto source_count=counts[static_cast<std::size_t>(source)];
+            if(source_count>std::numeric_limits<std::size_t>::max()-total) {
+                valid_layout=0; break;
+            }
+            total+=static_cast<std::size_t>(source_count);
+        }
+        if(valid_layout) output.resize(total);
+    }
+    MPI_Bcast(&valid_layout,1,MPI_INT,root,communicator);
+    if(!valid_layout) throw std::overflow_error("Variable MPI gather size overflows size_t");
+    constexpr auto maximum=static_cast<std::size_t>(std::numeric_limits<int>::max());
+    if(rank==root) {
+        if(count!=0) std::copy_n(input,count,output.begin()+static_cast<std::ptrdiff_t>(
+            offsets[static_cast<std::size_t>(root)]));
+        for(int source=0;source<size;++source) if(source!=root) {
+            const auto source_count=static_cast<std::size_t>(counts[static_cast<std::size_t>(source)]);
+            for(std::size_t offset=0;offset<source_count;) {
+                const auto chunk=std::min(maximum,source_count-offset);
+                MPI_Recv(output.data()+offsets[static_cast<std::size_t>(source)]+offset,
+                         static_cast<int>(chunk),type,source,tag,communicator,MPI_STATUS_IGNORE);
+                offset+=chunk;
+            }
+        }
+    } else {
+        for(std::size_t offset=0;offset<count;) {
+            const auto chunk=std::min(maximum,count-offset);
+            MPI_Send(input+offset,static_cast<int>(chunk),type,root,tag,communicator);
+            offset+=chunk;
+        }
+    }
+    return counts;
+}
+
 DosFragment summarize_distributed(EnergyWindow window,
                                   std::span<const std::unique_ptr<WangLandauWalker>> walkers,
                                   std::size_t bins,MPI_Comm communicator,
                                   bool allow_empty_intersection) {
+    (void)bins;
     const auto nan=std::numeric_limits<double>::quiet_NaN();
     const auto layout=walkers.front()->dos_grid();
     const auto cells=layout.cells();
+    if(layout.joint()) {
+        if(walkers.size()!=0&&cells>std::numeric_limits<std::size_t>::max()/walkers.size())
+            throw std::overflow_error("MPI local joint-DOS gather size overflows size_t");
+        const auto local_cells=walkers.size()*cells;
+        std::vector<double> local_log_g(local_cells);
+        std::vector<std::uint64_t> local_histogram(local_cells);
+        std::vector<std::uint8_t> local_active(local_cells);
+        for(std::size_t w=0;w<walkers.size();++w) {
+            std::copy(walkers[w]->log_g().begin(),walkers[w]->log_g().end(),
+                      local_log_g.begin()+static_cast<std::ptrdiff_t>(w*cells));
+            std::copy(walkers[w]->histogram().begin(),walkers[w]->histogram().end(),
+                      local_histogram.begin()+static_cast<std::ptrdiff_t>(w*cells));
+            std::copy(walkers[w]->active_mask().begin(),walkers[w]->active_mask().end(),
+                      local_active.begin()+static_cast<std::ptrdiff_t>(w*cells));
+        }
+        std::vector<double> gathered_log_g;
+        std::vector<std::uint64_t> gathered_histogram;
+        std::vector<std::uint8_t> gathered_active;
+        gather_chunks(local_log_g.data(),gathered_log_g,local_cells,MPI_DOUBLE,0,communicator);
+        gather_chunks(local_histogram.data(),gathered_histogram,local_cells,MPI_UINT64_T,0,communicator);
+        gather_chunks(local_active.data(),gathered_active,local_cells,MPI_UNSIGNED_CHAR,0,communicator);
+        int communicator_rank=0,communicator_size=1;
+        MPI_Comm_rank(communicator,&communicator_rank);
+        MPI_Comm_size(communicator,&communicator_size);
+        DosFragment result;
+        if(communicator_rank==0) {
+            const auto estimator_count=static_cast<std::size_t>(communicator_size)*walkers.size();
+            std::vector<EstimatorView> estimators;
+            estimators.reserve(estimator_count);
+            for(std::size_t w=0;w<estimator_count;++w) {
+                const auto offset=w*cells;
+                estimators.push_back({
+                    std::span<const double>(gathered_log_g).subspan(offset,cells),
+                    std::span<const std::uint64_t>(gathered_histogram).subspan(offset,cells),
+                    std::span<const std::uint8_t>(gathered_active).subspan(offset,cells)});
+            }
+            result=summarize_joint_union(window,layout,estimators);
+        } else {
+            result={window,std::vector<double>(cells,nan),std::vector<std::uint64_t>(cells),
+                std::vector<double>(cells,nan),std::vector<std::uint8_t>(cells),layout,
+                std::vector<std::uint32_t>(cells),std::vector<std::int32_t>(cells,-1)};
+        }
+        broadcast_chunks(result.log_g.data(),cells,MPI_DOUBLE,0,communicator);
+        broadcast_chunks(result.histogram.data(),cells,MPI_UINT64_T,0,communicator);
+        broadcast_chunks(result.standard_error.data(),cells,MPI_DOUBLE,0,communicator);
+        broadcast_chunks(result.valid.data(),cells,MPI_UNSIGNED_CHAR,0,communicator);
+        broadcast_chunks(result.contributors.data(),cells,MPI_UINT32_T,0,communicator);
+        broadcast_chunks(result.support_component.data(),cells,MPI_INT32_T,0,communicator);
+        return result;
+    }
     DosFragment f{window,std::vector<double>(cells,nan),std::vector<std::uint64_t>(cells,0),
-                  std::vector<double>(cells,nan),std::vector<std::uint8_t>(cells,0)};
-    f.grid=layout;
+                  std::vector<double>(cells,nan),std::vector<std::uint8_t>(cells,0),
+                  layout,{},{}};
     std::vector<std::uint64_t> local_histogram(cells,0),global_histogram(cells,0);
     std::vector<std::uint8_t> local_valid(cells,0),global_valid(cells,0);
     const auto begin=layout.flatten(window.begin),end=layout.flatten(window.end);
@@ -159,11 +455,11 @@ WindowSamplingStatistics summarize_sampling_distributed(
     auto local=summarize_sampling_impl(window,pointers,bins);
     WindowSamplingStatistics result{window,std::vector<double>(bins,0.0),
                                     std::vector<std::uint64_t>(bins,0)};
-    MPI_Allreduce(local.squared_energy_displacement.data(),
-                  result.squared_energy_displacement.data(),static_cast<int>(bins),MPI_DOUBLE,
-                  MPI_SUM,communicator);
-    MPI_Allreduce(local.displacement_samples.data(),result.displacement_samples.data(),
-                  static_cast<int>(bins),MPI_UINT64_T,MPI_SUM,communicator);
+    allreduce_chunks(local.squared_energy_displacement.data(),
+                     result.squared_energy_displacement.data(),bins,MPI_DOUBLE,
+                     MPI_SUM,communicator);
+    allreduce_chunks(local.displacement_samples.data(),result.displacement_samples.data(),
+                     bins,MPI_UINT64_T,MPI_SUM,communicator);
     MPI_Allreduce(&local.round_trips,&result.round_trips,1,MPI_UINT64_T,MPI_SUM,communicator);
     MPI_Allreduce(&local.walkers,&result.walkers,1,MPI_UINT64_T,MPI_SUM,communicator);
     return result;
@@ -229,12 +525,14 @@ void ParallelContext::broadcast_windows(std::vector<EnergyWindow>& windows) cons
 #ifdef WL_HAS_MPI
     std::uint64_t count=rank_==0?static_cast<std::uint64_t>(windows.size()):0;
     MPI_Bcast(&count,1,MPI_UINT64_T,0,MPI_COMM_WORLD);
+    if(count>std::numeric_limits<std::size_t>::max()/2)
+        throw std::overflow_error("MPI energy-window broadcast size overflows size_t");
     std::vector<std::uint64_t> packed(static_cast<std::size_t>(count)*2);
     if(rank_==0) for(std::size_t i=0;i<windows.size();++i) {
         packed[2*i]=static_cast<std::uint64_t>(windows[i].begin);
         packed[2*i+1]=static_cast<std::uint64_t>(windows[i].end);
     }
-    MPI_Bcast(packed.data(),static_cast<int>(packed.size()),MPI_UINT64_T,0,MPI_COMM_WORLD);
+    broadcast_chunks(packed.data(),packed.size(),MPI_UINT64_T,0,MPI_COMM_WORLD);
     if(rank_!=0) {
         windows.resize(static_cast<std::size_t>(count));
         for(std::size_t i=0;i<windows.size();++i)
@@ -251,17 +549,20 @@ void ParallelContext::broadcast_spin_configurations(
 #ifdef WL_HAS_MPI
     std::uint64_t count=rank_==0?static_cast<std::uint64_t>(configurations.size()):0;
     MPI_Bcast(&count,1,MPI_UINT64_T,0,MPI_COMM_WORLD);
+    if(count>std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("MPI configuration count overflows size_t");
     std::vector<std::uint64_t> sizes(static_cast<std::size_t>(count),0);
-    std::uint64_t total=0;
     if(rank_==0) for(std::size_t i=0;i<configurations.size();++i) {
         sizes[i]=static_cast<std::uint64_t>(configurations[i].size());
-        total+=sizes[i];
     }
-    MPI_Bcast(sizes.data(),static_cast<int>(sizes.size()),MPI_UINT64_T,0,MPI_COMM_WORLD);
-    for(const auto size:sizes) total+=rank_==0?0:size;
-    if(total>static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
-        throw std::runtime_error("Adaptive spin-configuration bank is too large for MPI");
-    std::vector<std::int8_t> packed(static_cast<std::size_t>(total));
+    broadcast_chunks(sizes.data(),sizes.size(),MPI_UINT64_T,0,MPI_COMM_WORLD);
+    std::size_t total=0;
+    for(const auto size:sizes) {
+        if(size>std::numeric_limits<std::size_t>::max()-total)
+            throw std::overflow_error("Adaptive spin-configuration bank overflows size_t");
+        total+=static_cast<std::size_t>(size);
+    }
+    std::vector<std::int8_t> packed(total);
     if(rank_==0) {
         std::size_t offset=0;
         for(const auto& configuration:configurations) {
@@ -270,7 +571,7 @@ void ParallelContext::broadcast_spin_configurations(
             offset+=configuration.size();
         }
     }
-    MPI_Bcast(packed.data(),static_cast<int>(packed.size()),MPI_BYTE,0,MPI_COMM_WORLD);
+    broadcast_chunks(packed.data(),packed.size(),MPI_BYTE,0,MPI_COMM_WORLD);
     if(rank_!=0) {
         configurations.resize(static_cast<std::size_t>(count));
         std::size_t offset=0;
@@ -300,6 +601,12 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
     const auto windows=c.explicit_windows.empty()?
         partition_windows(c.grid.bins(),c.windows,c.overlap):c.explicit_windows;
     const bool distributed=context.size()>1;
+    if(distributed&&!c.checkpoint_path.empty())
+        throw std::invalid_argument(
+            "MPI checkpoint/restart is not supported; checkpoint_path must be empty when MPI size > 1");
+    if(!c.checkpoint_path.empty()&&(c.windows!=1||c.walkers_per_rank!=1))
+        throw std::invalid_argument(
+            "Exact checkpoint/restart requires one window and one walker");
     if(distributed && context.size()%static_cast<int>(c.windows)!=0)
         throw std::invalid_argument("MPI size must be a multiple of the number of energy windows");
     const auto shards=distributed?static_cast<std::size_t>(context.size())/c.windows:1;
@@ -373,7 +680,12 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
         throw std::runtime_error("Walker initialization failed: "+initialization_error);
 
     if(!c.checkpoint_path.empty() && c.windows==1 && c.walkers_per_rank==1) {
-        try { groups[first_window][0]->restore(load_checkpoint(c.checkpoint_path)); }
+        try {
+            const auto checkpoint=load_checkpoint(c.checkpoint_path);
+            groups[first_window][0]->restore(checkpoint);
+            if(checkpoint.format_version<5&&context.rank()==0)
+                std::cerr<<"warning: restored a legacy 1D checkpoint without full grid metadata\n";
+        }
         catch(const std::exception& error) {
             if(context.rank()==0)
                 std::cerr<<"warning: checkpoint was not restored: "<<error.what()<<"; starting a new run\n";
@@ -447,20 +759,22 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
             else if(window_id>0 && (window_id-1)%2==parity) partner=context.rank()-static_cast<int>(shards);
             if(partner>=0) {
                 const auto slot=static_cast<std::size_t>(epoch%c.walkers_per_rank);
-                auto& walker=*groups[window_id][slot]; auto own=walker.snapshot();
-                double own_state[2]{own.energy,own.order_parameter},other_state[2]{};
+                auto& walker=*groups[window_id][slot];
+                const auto own_energy=walker.energy();
+                const auto own_order_parameter=walker.order_parameter();
+                double own_state[2]{own_energy,own_order_parameter},other_state[2]{};
                 MPI_Sendrecv(own_state,2,MPI_DOUBLE,partner,10,other_state,2,MPI_DOUBLE,partner,10,
                              MPI_COMM_WORLD,MPI_STATUS_IGNORE);
                 const auto other_energy=other_state[0];
                 const auto other_order_parameter=other_state[1];
-                const auto own_bin=c.grid.index(own.energy),other_bin=c.grid.index(other_energy);
+                const auto own_bin=c.grid.index(own_energy),other_bin=c.grid.index(other_energy);
                 double contribution=-std::numeric_limits<double>::infinity();
                 const auto layout=c.dos_grid();
-                const auto own_cell=layout.index(own.energy,own.order_parameter);
+                const auto own_cell=layout.index(own_energy,own_order_parameter);
                 const auto other_cell=layout.index(other_energy,other_order_parameter);
                 if(own_bin&&other_bin&&own_cell&&other_cell&&windows[window_id].contains(*own_bin)&&
                    windows[window_id].contains(*other_bin))
-                    contribution=own.log_g[*own_cell]-own.log_g[*other_cell];
+                    contribution=walker.log_g()[*own_cell]-walker.log_g()[*other_cell];
                 double other_contribution{};
                 MPI_Sendrecv(&contribution,1,MPI_DOUBLE,partner,11,&other_contribution,1,MPI_DOUBLE,partner,11,
                              MPI_COMM_WORLD,MPI_STATUS_IGNORE);
@@ -471,14 +785,14 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                     std::log(std::max(exchange_rng.uniform(),0x1.0p-53))<logp);
                 ++result.exchange_attempted;
                 if(accept) {
-                    std::vector<std::int8_t> remote_spins(own.spins.size());
-                    std::vector<double> remote_fields(own.fields.size());
-                    MPI_Sendrecv(own.spins.data(),static_cast<int>(own.spins.size()),MPI_BYTE,partner,12,
-                                 remote_spins.data(),static_cast<int>(remote_spins.size()),MPI_BYTE,partner,12,
-                                 MPI_COMM_WORLD,MPI_STATUS_IGNORE);
-                    MPI_Sendrecv(own.fields.data(),static_cast<int>(own.fields.size()),MPI_DOUBLE,partner,13,
-                                 remote_fields.data(),static_cast<int>(remote_fields.size()),MPI_DOUBLE,partner,13,
-                                 MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+                    const auto own_spins=walker.spins();
+                    const auto own_fields=walker.fields();
+                    std::vector<std::int8_t> remote_spins(own_spins.size());
+                    std::vector<double> remote_fields(own_fields.size());
+                    sendrecv_chunks(own_spins.data(),remote_spins.data(),own_spins.size(),
+                                    MPI_BYTE,partner,12,MPI_COMM_WORLD);
+                    sendrecv_chunks(own_fields.data(),remote_fields.data(),own_fields.size(),
+                                    MPI_DOUBLE,partner,13,MPI_COMM_WORLD);
                     walker.replace_configuration(remote_spins,remote_fields,other_energy,
                                                  other_order_parameter);
                     ++result.exchange_accepted;
@@ -615,19 +929,24 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
         std::uint64_t reduced[5]{}; MPI_Reduce(totals,reduced,5,MPI_UINT64_T,MPI_SUM,0,MPI_COMM_WORLD);
         int converged=local_converged?1:0,all_converged=0;
         MPI_Reduce(&converged,&all_converged,1,MPI_INT,MPI_MIN,0,MPI_COMM_WORLD);
-        const auto& local_fragment=result.fragments.front(); const auto bins=c.grid.bins();
+        const auto& local_fragment=result.fragments.front();
+        const auto bins=c.grid.bins();
+        const auto cells=c.dos_grid().cells();
         std::vector<double> all_logg,all_error;
         std::vector<std::uint64_t> all_hist;
         std::vector<std::uint8_t> all_valid;
-        if(context.rank()==0) {
-            all_logg.resize(bins*context.size()); all_error.resize(bins*context.size());
-            all_hist.resize(bins*context.size()); all_valid.resize(bins*context.size());
+        std::vector<std::uint32_t> all_contributors;
+        std::vector<std::int32_t> all_components;
+        gather_chunks(local_fragment.log_g.data(),all_logg,cells,MPI_DOUBLE,0,MPI_COMM_WORLD);
+        gather_chunks(local_fragment.standard_error.data(),all_error,cells,MPI_DOUBLE,0,MPI_COMM_WORLD);
+        gather_chunks(local_fragment.histogram.data(),all_hist,cells,MPI_UINT64_T,0,MPI_COMM_WORLD);
+        gather_chunks(local_fragment.valid.data(),all_valid,cells,MPI_UNSIGNED_CHAR,0,MPI_COMM_WORLD);
+        if(c.order_parameter) {
+            gather_chunks(local_fragment.contributors.data(),all_contributors,cells,
+                          MPI_UINT32_T,0,MPI_COMM_WORLD);
+            gather_chunks(local_fragment.support_component.data(),all_components,cells,
+                          MPI_INT32_T,0,MPI_COMM_WORLD);
         }
-        MPI_Gather(local_fragment.log_g.data(),static_cast<int>(bins),MPI_DOUBLE,all_logg.data(),static_cast<int>(bins),MPI_DOUBLE,0,MPI_COMM_WORLD);
-        MPI_Gather(local_fragment.standard_error.data(),static_cast<int>(bins),MPI_DOUBLE,all_error.data(),static_cast<int>(bins),MPI_DOUBLE,0,MPI_COMM_WORLD);
-        MPI_Gather(local_fragment.histogram.data(),static_cast<int>(bins),MPI_UINT64_T,all_hist.data(),static_cast<int>(bins),MPI_UINT64_T,0,MPI_COMM_WORLD);
-        MPI_Gather(local_fragment.valid.data(),static_cast<int>(bins),MPI_UNSIGNED_CHAR,
-                   all_valid.data(),static_cast<int>(bins),MPI_UNSIGNED_CHAR,0,MPI_COMM_WORLD);
         const auto local_stat_count=result.walker_statistics.size();
         constexpr std::size_t statistic_integer_fields=10;
         constexpr std::size_t statistic_double_fields=4;
@@ -654,31 +973,21 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
         }
         std::vector<std::uint64_t> all_stat_integers;
         std::vector<double> all_stat_doubles;
-        if(context.rank()==0) {
-            all_stat_integers.resize(local_stat_integers.size()*context.size());
-            all_stat_doubles.resize(local_stat_doubles.size()*context.size());
-        }
-        MPI_Gather(local_stat_integers.data(),static_cast<int>(local_stat_integers.size()),MPI_UINT64_T,
-                   all_stat_integers.data(),static_cast<int>(local_stat_integers.size()),MPI_UINT64_T,0,MPI_COMM_WORLD);
-        MPI_Gather(local_stat_doubles.data(),static_cast<int>(local_stat_doubles.size()),MPI_DOUBLE,
-                   all_stat_doubles.data(),static_cast<int>(local_stat_doubles.size()),MPI_DOUBLE,0,MPI_COMM_WORLD);
+        gather_chunks(local_stat_integers.data(),all_stat_integers,
+                      local_stat_integers.size(),MPI_UINT64_T,0,MPI_COMM_WORLD);
+        gather_chunks(local_stat_doubles.data(),all_stat_doubles,
+                      local_stat_doubles.size(),MPI_DOUBLE,0,MPI_COMM_WORLD);
         result.fragments.clear();
         std::vector<double> all_displacement;
         std::vector<std::uint64_t> all_displacement_samples;
         std::vector<std::uint64_t> all_sampling_scalars;
         if(c.wl.collect_window_statistics) {
             const auto& local_sampling=result.sampling_statistics.front();
-            if(context.rank()==0) {
-                all_displacement.resize(bins*context.size());
-                all_displacement_samples.resize(bins*context.size());
-                all_sampling_scalars.resize(2*context.size());
-            }
-            MPI_Gather(local_sampling.squared_energy_displacement.data(),static_cast<int>(bins),
-                       MPI_DOUBLE,all_displacement.data(),static_cast<int>(bins),MPI_DOUBLE,0,
-                       MPI_COMM_WORLD);
-            MPI_Gather(local_sampling.displacement_samples.data(),static_cast<int>(bins),MPI_UINT64_T,
-                       all_displacement_samples.data(),static_cast<int>(bins),MPI_UINT64_T,0,
-                       MPI_COMM_WORLD);
+            gather_chunks(local_sampling.squared_energy_displacement.data(),all_displacement,bins,
+                          MPI_DOUBLE,0,MPI_COMM_WORLD);
+            gather_chunks(local_sampling.displacement_samples.data(),all_displacement_samples,bins,
+                          MPI_UINT64_T,0,MPI_COMM_WORLD);
+            if(context.rank()==0) all_sampling_scalars.resize(2*context.size());
             const std::uint64_t local_sampling_scalars[2]{local_sampling.round_trips,
                                                            local_sampling.walkers};
             MPI_Gather(local_sampling_scalars,2,MPI_UINT64_T,all_sampling_scalars.data(),2,
@@ -688,6 +997,12 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
         std::vector<std::int8_t> all_representative_spins;
         if(c.wl.collect_window_statistics) {
             const auto local_representative_count=result.representatives.size();
+            const int local_overflow=couplings->size()!=0&&local_representative_count>
+                std::numeric_limits<std::size_t>::max()/couplings->size()?1:0;
+            int any_overflow=0;
+            MPI_Allreduce(&local_overflow,&any_overflow,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
+            if(any_overflow)
+                throw std::overflow_error("Local representative spin storage overflows size_t");
             std::vector<double> local_energies(local_representative_count);
             std::vector<std::int8_t> local_spins(local_representative_count*couplings->size());
             for(std::size_t i=0;i<local_representative_count;++i) {
@@ -696,16 +1011,20 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                           result.representatives[i].spins.end(),
                           local_spins.begin()+static_cast<std::ptrdiff_t>(i*couplings->size()));
             }
+            (void)gather_variable_chunks(local_energies.data(),local_energies.size(),
+                all_representative_energies,MPI_DOUBLE,0,201,MPI_COMM_WORLD);
+            (void)gather_variable_chunks(local_spins.data(),local_spins.size(),
+                all_representative_spins,MPI_BYTE,0,202,MPI_COMM_WORLD);
+            int representative_payload_valid=1;
             if(context.rank()==0) {
-                all_representative_energies.resize(local_representative_count*context.size());
-                all_representative_spins.resize(local_spins.size()*context.size());
+                const auto count=all_representative_energies.size();
+                representative_payload_valid=couplings->size()==0||
+                    (count<=std::numeric_limits<std::size_t>::max()/couplings->size()&&
+                     all_representative_spins.size()==count*couplings->size());
             }
-            MPI_Gather(local_energies.data(),static_cast<int>(local_energies.size()),MPI_DOUBLE,
-                       all_representative_energies.data(),static_cast<int>(local_energies.size()),
-                       MPI_DOUBLE,0,MPI_COMM_WORLD);
-            MPI_Gather(local_spins.data(),static_cast<int>(local_spins.size()),MPI_BYTE,
-                       all_representative_spins.data(),static_cast<int>(local_spins.size()),
-                       MPI_BYTE,0,MPI_COMM_WORLD);
+            MPI_Bcast(&representative_payload_valid,1,MPI_INT,0,MPI_COMM_WORLD);
+            if(!representative_payload_valid)
+                throw std::runtime_error("MPI representative payload sizes are inconsistent");
         }
         result.sampling_statistics.clear();
         result.representatives.clear();
@@ -731,24 +1050,33 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
             }
             for(std::size_t w=0;w<c.windows;++w) {
                 const auto leader_rank=w*shards;
-                const auto offset=leader_rank*bins;
-                DosFragment f{windows[w],std::vector<double>(bins),
-                              std::vector<std::uint64_t>(bins),std::vector<double>(bins),
-                              std::vector<std::uint8_t>(bins)};
-                std::copy_n(all_logg.begin()+static_cast<std::ptrdiff_t>(offset),bins,f.log_g.begin());
-                std::copy_n(all_hist.begin()+static_cast<std::ptrdiff_t>(offset),bins,f.histogram.begin());
-                std::copy_n(all_error.begin()+static_cast<std::ptrdiff_t>(offset),bins,
-                            f.standard_error.begin());
-                std::copy_n(all_valid.begin()+static_cast<std::ptrdiff_t>(offset),bins,f.valid.begin());
+                const auto dos_offset=leader_rank*cells;
+                DosFragment f{windows[w],std::vector<double>(cells),
+                              std::vector<std::uint64_t>(cells),std::vector<double>(cells),
+                              std::vector<std::uint8_t>(cells),c.dos_grid(),{}, {}};
+                std::copy_n(all_logg.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,f.log_g.begin());
+                std::copy_n(all_hist.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,f.histogram.begin());
+                std::copy_n(all_error.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,
+                             f.standard_error.begin());
+                std::copy_n(all_valid.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,f.valid.begin());
+                if(c.order_parameter) {
+                    f.contributors.resize(cells);
+                    f.support_component.resize(cells);
+                    std::copy_n(all_contributors.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,
+                                f.contributors.begin());
+                    std::copy_n(all_components.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,
+                                f.support_component.begin());
+                }
                 result.fragments.push_back(std::move(f));
                 if(c.wl.collect_window_statistics) {
                     WindowSamplingStatistics sampling_result{
                         windows[w],std::vector<double>(bins),std::vector<std::uint64_t>(bins),
                         all_sampling_scalars[2*leader_rank],
                         all_sampling_scalars[2*leader_rank+1]};
-                    std::copy_n(all_displacement.begin()+static_cast<std::ptrdiff_t>(offset),bins,
+                    const auto sampling_offset=leader_rank*bins;
+                    std::copy_n(all_displacement.begin()+static_cast<std::ptrdiff_t>(sampling_offset),bins,
                                 sampling_result.squared_energy_displacement.begin());
-                    std::copy_n(all_displacement_samples.begin()+static_cast<std::ptrdiff_t>(offset),
+                    std::copy_n(all_displacement_samples.begin()+static_cast<std::ptrdiff_t>(sampling_offset),
                                 bins,sampling_result.displacement_samples.begin());
                     result.sampling_statistics.push_back(std::move(sampling_result));
                 }

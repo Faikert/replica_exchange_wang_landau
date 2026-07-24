@@ -46,7 +46,9 @@ int main(int argc,char** argv) {
                  <<" joint="<<(joint?"yes":"no")<<" dos_cells="<<dos_grid.cells()
                  <<" cell_checksum="<<cell_checksum
                  <<" attempted_mcs="<<static_cast<double>(attempts)/static_cast<double>(spins.size())
-                 <<" seconds="<<seconds<<" attempted_flips_per_second="<<attempts/seconds
-                 <<" mcs_per_second="<<attempts/(seconds*static_cast<double>(spins.size()))<<'\n';
+                 <<" seconds="<<seconds<<" attempted_flips_per_second="
+                 <<static_cast<double>(attempts)/seconds
+                 <<" mcs_per_second="<<static_cast<double>(attempts)/
+                    (seconds*static_cast<double>(spins.size()))<<'\n';
     } catch(const std::exception& error) { std::cerr<<"wl_bench: "<<error.what()<<'\n'; return 1; }
 }

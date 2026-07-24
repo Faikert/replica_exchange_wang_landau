@@ -65,6 +65,16 @@ if(WL_BUILD_TESTS)
     add_test(NAME wl_mpi_smoke
       COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
               $<TARGET_FILE:wl_run> --smoke-test)
+    add_test(NAME wl_mpi_joint_smoke
+      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+              $<TARGET_FILE:wl_run> --smoke-test
+              --geometry ${CMAKE_SOURCE_DIR}/examples/system_weighted.csv
+              --periodic false --order-parameter weighted_sum --q-bin-width 1
+              --support-stability-checks 1)
+    add_test(NAME wl_mpi_checkpoint_rejected
+      COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
+              $<TARGET_FILE:wl_run> --smoke-test --checkpoint wl_mpi_forbidden.chk)
+    set_tests_properties(wl_mpi_checkpoint_rejected PROPERTIES WILL_FAIL TRUE TIMEOUT 15)
     add_test(NAME wl_mpi_initialization_failure
       COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2
               $<TARGET_FILE:wl_run>

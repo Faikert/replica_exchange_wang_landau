@@ -101,7 +101,8 @@ void write_metadata_json(const std::string& path, const RunConfig& config,
                          std::uint64_t accepted, std::uint64_t forced_accepted,
                          std::uint64_t exchange_attempted,
                          std::uint64_t exchange_accepted, bool converged, int mpi_size,
-                         int openmp_threads);
+                         int openmp_threads,
+                         std::string_view postprocessing_status = "complete");
 void save_checkpoint(const std::string& path, const WalkerSnapshot& snapshot);
 [[nodiscard]] WalkerSnapshot load_checkpoint(const std::string& path);
 

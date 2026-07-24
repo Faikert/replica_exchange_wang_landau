@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <queue>
 #include <stdexcept>
 
 namespace wl {
@@ -41,6 +42,10 @@ double local_slope(const std::vector<double>& values,const std::vector<std::uint
 }
 
 } // namespace
+
+DisconnectedSupportError::DisconnectedSupportError(std::size_t components)
+    : std::runtime_error("Joint DOS support has "+std::to_string(components)+
+                         " disconnected components"),components_(components) {}
 
 DensityOfStates stitch_dos(EnergyGrid grid, std::span<const DosFragment> input,
                            bool complete_range, std::size_t spin_count) {
@@ -166,18 +171,96 @@ DosFragment exact_enumeration(const Couplings& couplings, EnergyGrid grid,
     std::vector<std::uint64_t> counts(grid.bins(), 0);
     std::vector<std::int8_t> spins(n, -1);
     const auto states = std::uint64_t{1} << n;
+    std::uint64_t in_grid=0;
     for (std::uint64_t state = 0; state < states; ++state) {
         for (std::size_t i = 0; i < n; ++i) spins[i] = (state & (std::uint64_t{1} << i)) ? 1 : -1;
         const auto bin = grid.index(total_energy(couplings, spins));
-        if (bin) ++counts[*bin];
+        if (bin) { ++counts[*bin]; ++in_grid; }
     }
+    if(in_grid!=states)
+        throw std::runtime_error("Exact enumeration lost "+std::to_string(states-in_grid)+
+                                 " states outside the energy grid");
     std::vector<double> log_g(grid.bins(), -std::numeric_limits<double>::infinity());
     for (std::size_t i = 0; i < counts.size(); ++i)
         if (counts[i]) log_g[i] = std::log(static_cast<double>(counts[i]));
     // Exact enumeration confirms both occupied bins and exact zero-DOS bins.
     std::vector<std::uint8_t> valid(grid.bins(),1);
     return {{0, grid.bins()}, std::move(log_g), std::move(counts),
-            std::vector<double>(grid.bins(), 0.0),std::move(valid)};
+            std::vector<double>(grid.bins(), 0.0),std::move(valid),
+            DosGrid{grid,std::nullopt},{},{}};
+}
+
+struct StitchNode {
+    std::size_t fragment{};
+    std::int32_t component{};
+};
+
+struct StitchEdge {
+    std::size_t first{},second{};
+    long double weight{},difference{};
+};
+
+std::pair<std::vector<double>,std::size_t> solve_stitch_offsets(
+    std::size_t node_count,std::span<const StitchEdge> edges) {
+    std::vector<std::vector<std::size_t>> adjacency(node_count);
+    for(const auto& edge:edges) {
+        adjacency[edge.first].push_back(edge.second);
+        adjacency[edge.second].push_back(edge.first);
+    }
+    std::vector<std::int32_t> component(node_count,-1);
+    std::vector<double> shifts(node_count,0.0);
+    std::size_t components=0;
+    for(std::size_t seed=0;seed<node_count;++seed) if(component[seed]<0) {
+        const auto label=static_cast<std::int32_t>(components++);
+        std::vector<std::size_t> nodes;
+        std::queue<std::size_t> pending; pending.push(seed); component[seed]=label;
+        while(!pending.empty()) {
+            const auto node=pending.front(); pending.pop(); nodes.push_back(node);
+            for(const auto other:adjacency[node]) if(component[other]<0) {
+                component[other]=label; pending.push(other);
+            }
+        }
+        if(nodes.size()==1) continue;
+        std::vector<std::size_t> equation(node_count,std::numeric_limits<std::size_t>::max());
+        for(std::size_t i=1;i<nodes.size();++i) equation[nodes[i]]=i-1;
+        const auto unknowns=nodes.size()-1;
+        std::vector<long double> matrix(unknowns*(unknowns+1),0.0L);
+        const auto add=[&](std::size_t row,std::size_t column,long double value) {
+            if(row!=std::numeric_limits<std::size_t>::max()&&
+               column!=std::numeric_limits<std::size_t>::max())
+                matrix[row*(unknowns+1)+column]+=value;
+        };
+        for(const auto& edge:edges) if(component[edge.first]==label&&component[edge.second]==label) {
+            const auto a=equation[edge.first],b=equation[edge.second];
+            add(a,a,edge.weight); add(b,b,edge.weight);
+            add(a,b,-edge.weight); add(b,a,-edge.weight);
+            if(a!=std::numeric_limits<std::size_t>::max())
+                matrix[a*(unknowns+1)+unknowns]-=edge.weight*edge.difference;
+            if(b!=std::numeric_limits<std::size_t>::max())
+                matrix[b*(unknowns+1)+unknowns]+=edge.weight*edge.difference;
+        }
+        for(std::size_t column=0;column<unknowns;++column) {
+            auto pivot=column;
+            for(std::size_t row=column+1;row<unknowns;++row)
+                if(std::abs(matrix[row*(unknowns+1)+column])>
+                   std::abs(matrix[pivot*(unknowns+1)+column])) pivot=row;
+            if(!(std::abs(matrix[pivot*(unknowns+1)+column])>0.0L))
+                throw std::runtime_error("Singular joint-DOS stitching system");
+            if(pivot!=column) for(std::size_t j=column;j<=unknowns;++j)
+                std::swap(matrix[pivot*(unknowns+1)+j],matrix[column*(unknowns+1)+j]);
+            const auto divisor=matrix[column*(unknowns+1)+column];
+            for(std::size_t j=column;j<=unknowns;++j)
+                matrix[column*(unknowns+1)+j]/=divisor;
+            for(std::size_t row=0;row<unknowns;++row) if(row!=column) {
+                const auto multiplier=matrix[row*(unknowns+1)+column];
+                for(std::size_t j=column;j<=unknowns;++j)
+                    matrix[row*(unknowns+1)+j]-=multiplier*matrix[column*(unknowns+1)+j];
+            }
+        }
+        for(std::size_t i=1;i<nodes.size();++i)
+            shifts[nodes[i]]=static_cast<double>(matrix[(i-1)*(unknowns+1)+unknowns]);
+    }
+    return {std::move(shifts),components};
 }
 
 DosFragment exact_enumeration(const Couplings& couplings,DosGrid grid,
@@ -192,17 +275,23 @@ DosFragment exact_enumeration(const Couplings& couplings,DosGrid grid,
     std::vector<std::uint64_t> counts(grid.cells(),0);
     std::vector<std::int8_t> spins(n,-1);
     const auto states=std::uint64_t{1}<<n;
+    std::uint64_t in_grid=0;
     for(std::uint64_t state=0;state<states;++state) {
         for(std::size_t i=0;i<n;++i)
             spins[i]=(state&(std::uint64_t{1}<<i))?1:-1;
         const auto cell=grid.index(total_energy(couplings,spins),order_parameter.evaluate(spins));
-        if(cell) ++counts[*cell];
+        if(cell) { ++counts[*cell]; ++in_grid; }
     }
+    if(in_grid!=states)
+        throw std::runtime_error("Exact enumeration lost "+std::to_string(states-in_grid)+
+                                 " states outside the joint DOS grid");
     std::vector<double> log_g(grid.cells(),-std::numeric_limits<double>::infinity());
     for(std::size_t i=0;i<counts.size();++i) if(counts[i]) log_g[i]=std::log(static_cast<double>(counts[i]));
     DosFragment result{{0,grid.energy_bins()},std::move(log_g),std::move(counts),
-        std::vector<double>(grid.cells(),0.0),std::vector<std::uint8_t>(grid.cells(),1)};
-    result.grid=grid;
+        std::vector<double>(grid.cells(),0.0),std::vector<std::uint8_t>(grid.cells(),1),
+        grid,{},{}};
+    result.contributors.assign(grid.cells(),1);
+    result.support_component.assign(grid.cells(),0);
     return result;
 }
 
@@ -210,21 +299,34 @@ DosFragment marginalize_fragment(const DosFragment& joint) {
     if(!joint.grid.joint()) return joint;
     const auto& layout=joint.grid;
     const auto e_bins=layout.energy_bins(),q_bins=layout.q_bins();
+    if(joint.window.begin>=joint.window.end||joint.window.end>e_bins||
+       joint.log_g.size()!=layout.cells()||joint.histogram.size()!=joint.log_g.size()||
+       joint.standard_error.size()!=joint.log_g.size()||joint.valid.size()!=joint.log_g.size())
+        throw std::invalid_argument("Invalid joint DOS fragment for marginalization");
     const auto nan=std::numeric_limits<double>::quiet_NaN();
     DosFragment result{joint.window,std::vector<double>(e_bins,nan),
         std::vector<std::uint64_t>(e_bins,0),std::vector<double>(e_bins,nan),
-        std::vector<std::uint8_t>(e_bins,0)};
-    result.grid={layout.energy,std::nullopt};
+        std::vector<std::uint8_t>(e_bins,0),DosGrid{layout.energy,std::nullopt},{},{}};
     std::vector<double> values;
     for(std::size_t e=joint.window.begin;e<joint.window.end;++e) {
         values.clear();
+        bool known=false;
         for(std::size_t q=0;q<q_bins;++q) {
             const auto cell=layout.flatten(e,q);
             result.histogram[e]+=joint.histogram[cell];
-            if(joint.valid[cell]!=0&&std::isfinite(joint.log_g[cell])) values.push_back(joint.log_g[cell]);
+            if(joint.valid[cell]!=0) {
+                known=true;
+                if(std::isfinite(joint.log_g[cell])) values.push_back(joint.log_g[cell]);
+            }
         }
-        if(values.empty()) continue;
-        result.valid[e]=1; result.log_g[e]=log_sum_exp(values);
+        if(!known) continue;
+        result.valid[e]=1;
+        if(values.empty()) {
+            result.log_g[e]=-std::numeric_limits<double>::infinity();
+            result.standard_error[e]=0.0;
+            continue;
+        }
+        result.log_g[e]=log_sum_exp(values);
         double variance=0.0; bool finite_sem=true;
         for(std::size_t q=0;q<q_bins;++q) {
             const auto cell=layout.flatten(e,q);
@@ -238,70 +340,163 @@ DosFragment marginalize_fragment(const DosFragment& joint) {
     return result;
 }
 
+std::size_t support_component_count(const DosFragment& fragment) {
+    if(!fragment.grid.joint()) return std::any_of(fragment.valid.begin(),fragment.valid.end(),
+        [](auto value){return value!=0;})?1:0;
+    if(fragment.valid.size()!=fragment.grid.cells()||
+       (!fragment.support_component.empty()&&
+        fragment.support_component.size()!=fragment.valid.size()))
+        throw std::invalid_argument("Invalid support-component layout");
+    std::vector<std::int32_t> components;
+    for(std::size_t cell=0;cell<fragment.valid.size();++cell) if(fragment.valid[cell]) {
+        const auto component=fragment.support_component.empty()?0:fragment.support_component[cell];
+        if(component<0) throw std::invalid_argument("Valid cell has no support component");
+        if(std::find(components.begin(),components.end(),component)==components.end())
+            components.push_back(component);
+    }
+    return components.size();
+}
+
 JointDensityOfStates stitch_joint_dos(DosGrid grid,std::span<const DosFragment> input,
                                       bool complete_range,bool converged,
                                       std::size_t spin_count,double normalization) {
     grid.validate();
-    if(!grid.joint()||input.empty()) throw std::invalid_argument("No joint DOS fragments supplied");
+    if(!grid.joint()||input.empty()||!(normalization>0.0)||!std::isfinite(normalization))
+        throw std::invalid_argument("No valid joint DOS fragments supplied");
     std::vector<DosFragment> fragments(input.begin(),input.end());
     std::sort(fragments.begin(),fragments.end(),[](const auto& a,const auto& b){
         return a.window.begin<b.window.begin;
     });
     const auto cells=grid.cells(),q_bins=grid.q_bins();
     const auto nan=std::numeric_limits<double>::quiet_NaN();
-    JointDensityOfStates result{grid,normalization,std::vector<double>(cells,nan),
-        std::vector<std::uint64_t>(cells,0),std::vector<double>(cells,nan),
-        std::vector<std::uint8_t>(cells,0),false};
-    const auto copy_cell=[&](std::size_t cell,const DosFragment& source,double shift) {
-        result.histogram[cell]=source.histogram[cell]; result.valid[cell]=source.valid[cell];
-        if(source.valid[cell]) { result.log_g[cell]=source.log_g[cell]+shift; result.standard_error[cell]=source.standard_error[cell]; }
+    const auto same_grid=[&](const DosGrid& other) {
+        return other.joint()&&other.energy.minimum==grid.energy.minimum&&
+            other.energy.maximum==grid.energy.maximum&&other.energy.width==grid.energy.width&&
+            other.order_parameter->minimum==grid.order_parameter->minimum&&
+            other.order_parameter->maximum==grid.order_parameter->maximum&&
+            other.order_parameter->width==grid.order_parameter->width;
     };
-    auto& first=fragments.front();
-    if(first.log_g.size()!=cells) throw std::invalid_argument("Joint DOS fragment size mismatch");
-    for(auto cell=grid.flatten(first.window.begin);cell<grid.flatten(first.window.end);++cell)
-        copy_cell(cell,first,0.0);
-    auto covered_end=first.window.end;
-    for(std::size_t f=1;f<fragments.size();++f) {
-        const auto& right=fragments[f];
-        if(right.log_g.size()!=cells||right.window.begin>=covered_end)
-            throw std::invalid_argument("Joint DOS fragments must overlap and match the grid");
-        const auto overlap_begin=right.window.begin;
-        const auto overlap_end=std::min(covered_end,right.window.end);
-        long double weighted_difference=0.0L,total_weight=0.0L;
+    for(const auto& fragment:fragments) {
+        if(!same_grid(fragment.grid)||fragment.window.begin>=fragment.window.end||
+           fragment.window.end>grid.energy_bins()||fragment.log_g.size()!=cells||
+           fragment.histogram.size()!=cells||fragment.standard_error.size()!=cells||
+           fragment.valid.size()!=cells||
+           (!fragment.contributors.empty()&&fragment.contributors.size()!=cells)||
+           (!fragment.support_component.empty()&&fragment.support_component.size()!=cells))
+            throw std::invalid_argument("Joint DOS fragment layout mismatch");
+    }
+    for(std::size_t f=1;f<fragments.size();++f)
+        if(fragments[f].window.begin>=fragments[f-1].window.end)
+            throw std::invalid_argument("Joint DOS fragments must overlap");
+
+    const auto component_at=[](const DosFragment& fragment,std::size_t cell) {
+        return fragment.support_component.empty()?std::int32_t{0}:
+            fragment.support_component[cell];
+    };
+    const auto contributors_at=[](const DosFragment& fragment,std::size_t cell) {
+        return fragment.contributors.empty()?
+            static_cast<std::uint32_t>(fragment.valid[cell]!=0):fragment.contributors[cell];
+    };
+    std::vector<StitchNode> nodes;
+    std::vector<std::vector<std::pair<std::int32_t,std::size_t>>> node_lookup(fragments.size());
+    for(std::size_t f=0;f<fragments.size();++f) {
+        const auto begin=grid.flatten(fragments[f].window.begin);
+        const auto end=grid.flatten(fragments[f].window.end);
+        for(std::size_t cell=begin;cell<end;++cell) if(fragments[f].valid[cell]) {
+            const auto component=component_at(fragments[f],cell);
+            if(component<0) throw std::invalid_argument("Valid joint DOS cell has no support component");
+            const auto found=std::find_if(node_lookup[f].begin(),node_lookup[f].end(),
+                [component](const auto& item){return item.first==component;});
+            if(found==node_lookup[f].end()) {
+                node_lookup[f].push_back({component,nodes.size()});
+                nodes.push_back({f,component});
+            }
+        }
+    }
+    if(nodes.empty()) throw DisconnectedSupportError(0);
+    std::vector<StitchEdge> edges;
+    for(std::size_t a=0;a<nodes.size();++a) for(std::size_t b=a+1;b<nodes.size();++b) {
+        if(nodes[a].fragment==nodes[b].fragment) continue;
+        const auto& left=fragments[nodes[a].fragment];
+        const auto& right=fragments[nodes[b].fragment];
+        const auto overlap_begin=std::max(left.window.begin,right.window.begin);
+        const auto overlap_end=std::min(left.window.end,right.window.end);
+        if(overlap_begin>=overlap_end) continue;
+        long double total_weight=0.0L,weighted_difference=0.0L;
         for(std::size_t e=overlap_begin;e<overlap_end;++e)
             for(std::size_t q=0;q<q_bins;++q) {
                 const auto cell=grid.flatten(e,q);
-                if(result.valid[cell]&&right.valid[cell]&&std::isfinite(result.log_g[cell])&&
-                   std::isfinite(right.log_g[cell])) {
+                if(left.valid[cell]&&right.valid[cell]&&
+                   component_at(left,cell)==nodes[a].component&&
+                   component_at(right,cell)==nodes[b].component&&
+                   std::isfinite(left.log_g[cell])&&std::isfinite(right.log_g[cell])) {
                     const auto weight=1.0L+static_cast<long double>(
-                        std::min(result.histogram[cell],right.histogram[cell]));
-                    weighted_difference+=weight*(result.log_g[cell]-right.log_g[cell]);
+                        std::min(left.histogram[cell],right.histogram[cell]));
                     total_weight+=weight;
+                    weighted_difference+=weight*(left.log_g[cell]-right.log_g[cell]);
                 }
             }
-        if(!(total_weight>0.0L))
-            throw std::runtime_error("Adjacent joint DOS fragments have no common valid cell");
-        const auto shift=static_cast<double>(weighted_difference/total_weight);
+        if(total_weight>0.0L)
+            edges.push_back({a,b,total_weight,weighted_difference/total_weight});
+    }
+    auto [node_shifts,support_components]=solve_stitch_offsets(nodes.size(),edges);
+    if(support_components!=1) throw DisconnectedSupportError(support_components);
+    const auto node_for=[&](std::size_t fragment,std::size_t cell) {
+        const auto component=component_at(fragments[fragment],cell);
+        const auto found=std::find_if(node_lookup[fragment].begin(),node_lookup[fragment].end(),
+            [component](const auto& item){return item.first==component;});
+        if(found==node_lookup[fragment].end())
+            throw std::logic_error("Missing joint DOS support node");
+        return found->second;
+    };
+
+    JointDensityOfStates result{grid,normalization,std::vector<double>(cells,nan),
+        std::vector<std::uint64_t>(cells,0),std::vector<double>(cells,nan),
+        std::vector<std::uint8_t>(cells,0),std::vector<std::uint32_t>(cells,0),
+        std::vector<std::int32_t>(cells,-1),false};
+    const auto copy_cell=[&](std::size_t cell,const DosFragment& source,std::size_t fragment) {
+        result.histogram[cell]=source.histogram[cell]; result.valid[cell]=source.valid[cell];
+        if(source.valid[cell]) {
+            result.log_g[cell]=source.log_g[cell]+node_shifts[node_for(fragment,cell)];
+            result.standard_error[cell]=source.standard_error[cell];
+            result.contributors[cell]=contributors_at(source,cell);
+            result.support_component[cell]=0;
+        }
+    };
+    const auto& first=fragments.front();
+    for(auto cell=grid.flatten(first.window.begin);cell<grid.flatten(first.window.end);++cell)
+        copy_cell(cell,first,0);
+    auto covered_end=first.window.end;
+    for(std::size_t f=1;f<fragments.size();++f) {
+        const auto& right=fragments[f];
+        const auto overlap_begin=right.window.begin;
+        const auto overlap_end=std::min(covered_end,right.window.end);
         for(std::size_t e=right.window.begin;e<right.window.end;++e)
             for(std::size_t q=0;q<q_bins;++q) {
                 const auto cell=grid.flatten(e,q);
                 const bool left_valid=result.valid[cell]!=0;
                 const bool right_valid=right.valid[cell]!=0;
                 if(!right_valid) continue;
+                const auto right_value=right.log_g[cell]+node_shifts[node_for(f,cell)];
                 if(left_valid&&e<overlap_end) {
                     const auto alpha=std::clamp((static_cast<double>(e-overlap_begin)+0.5)/
                         static_cast<double>(overlap_end-overlap_begin),0.0,1.0);
-                    result.log_g[cell]=(1.0-alpha)*result.log_g[cell]+alpha*(right.log_g[cell]+shift);
+                    if(std::isfinite(result.log_g[cell])&&std::isfinite(right_value))
+                        result.log_g[cell]=(1.0-alpha)*result.log_g[cell]+alpha*right_value;
+                    else if(std::isfinite(right_value)) result.log_g[cell]=right_value;
                     const auto a=result.standard_error[cell],b=right.standard_error[cell];
                     result.standard_error[cell]=std::isfinite(a)&&std::isfinite(b)?
                         std::hypot((1.0-alpha)*a,alpha*b):nan;
                     result.histogram[cell]+=right.histogram[cell];
-                } else copy_cell(cell,right,shift);
+                    result.contributors[cell]+=contributors_at(right,cell);
+                } else copy_cell(cell,right,f);
             }
         covered_end=std::max(covered_end,right.window.end);
     }
     if(complete_range&&converged) {
-        const auto shift=static_cast<double>(spin_count)*std::log(2.0)-log_sum_exp(result.log_g);
+        const auto log_total=log_sum_exp(result.log_g);
+        if(!std::isfinite(log_total)) throw std::runtime_error("Joint DOS has no finite support");
+        const auto shift=static_cast<double>(spin_count)*std::log(2.0)-log_total;
         for(std::size_t i=0;i<cells;++i) if(result.valid[i]) result.log_g[i]+=shift;
         result.fully_normalized=true;
     } else {
@@ -315,8 +510,7 @@ JointDensityOfStates stitch_joint_dos(DosGrid grid,std::span<const DosFragment> 
 
 DensityOfStates marginalize(const JointDensityOfStates& joint) {
     DosFragment fragment{{0,joint.grid.energy_bins()},joint.log_g,joint.histogram,
-        joint.standard_error,joint.valid};
-    fragment.grid=joint.grid;
+        joint.standard_error,joint.valid,joint.grid,joint.contributors,joint.support_component};
     const auto marginal=marginalize_fragment(fragment);
     return {joint.grid.energy,marginal.log_g,marginal.histogram,marginal.standard_error,
         marginal.valid,{},joint.fully_normalized};
@@ -326,6 +520,9 @@ std::vector<OrderParameterDistributionPoint> order_parameter_distribution(
     const JointDensityOfStates& dos,std::span<const double> temperatures,double k_b) {
     if(!(k_b>0.0)||!dos.grid.joint()||!(dos.normalization>0.0))
         throw std::invalid_argument("Invalid joint DOS distribution request");
+    if(dos.log_g.size()!=dos.grid.cells()||dos.valid.size()!=dos.log_g.size()||
+       dos.histogram.size()!=dos.log_g.size()||dos.standard_error.size()!=dos.log_g.size())
+        throw std::invalid_argument("Invalid joint DOS arrays for distribution");
     std::vector<OrderParameterDistributionPoint> result;
     const auto e_bins=dos.grid.energy_bins(),q_bins=dos.grid.q_bins();
     std::vector<double> log_q(q_bins),terms;

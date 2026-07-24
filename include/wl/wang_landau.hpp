@@ -113,7 +113,10 @@ struct EnergyRepresentative {
 };
 
 struct WalkerSnapshot {
+    std::uint8_t format_version{5};
     std::uint64_t walker_id{};
+    EnergyGrid energy_grid{};
+    EnergyWindow energy_window{};
     std::vector<std::int8_t> spins;
     std::vector<double> fields;
     double energy{};
@@ -121,6 +124,7 @@ struct WalkerSnapshot {
     bool joint_dos{false};
     OrderParameterGrid order_grid{};
     double order_normalization{};
+    std::vector<double> order_weights;
     std::vector<double> log_g;
     std::vector<std::uint64_t> histogram;
     std::vector<std::uint8_t> active;
@@ -184,6 +188,8 @@ public:
     [[nodiscard]] std::uint64_t last_accepted_attempt() const noexcept {
         return last_accepted_attempt_;
     }
+    [[nodiscard]] std::span<const std::int8_t> spins() const noexcept { return spins_; }
+    [[nodiscard]] std::span<const double> fields() const noexcept { return fields_; }
 
     void replace_configuration(std::span<const std::int8_t> spins,
                                std::span<const double> fields, double energy,

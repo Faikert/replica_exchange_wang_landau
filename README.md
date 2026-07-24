@@ -59,7 +59,11 @@ build/Release/wl_exact.exe --config examples/run_2d.ini --output exact_2d
 The 2D run writes `_dos2d.csv`, the marginal `_dos.csv`, `_q_thermo.csv`,
 `_q_distribution.csv`, and per-window `_window_N_dos2d.csv` files. The Q thermodynamics
 include signed and absolute moments, `chi_q=N(<q^2>-<q>^2)/(k_B T)`, and the Binder
-cumulant `U4=1-<q^4>/(3<q^2>^2)`. Moments use Q-bin centers.
+cumulant `U4=1-<q^4>/(3<q^2>^2)`. Moments use Q-bin centers. Joint CSV files also report
+the number of contributing walkers and the connected support component. Walkers are aligned
+by weighted least squares over their shared cells; cells visited by at least one aligned walker
+form the relaxed-union estimate. If the support graph is disconnected, window fragments,
+metadata, and walker diagnostics are still written, but a global DOS and thermodynamics are not.
 
 User-facing work intervals are expressed in Monte Carlo sweeps (MCS): one MCS is `N` attempted single-spin flips per walker, with spins selected randomly with replacement. Fractional MCS values are allowed and resolve to the nearest positive integer number of flip attempts. The preferred keys are `exchange_interval_mcs`, `check_interval_mcs`, `force_accept_after_mcs`, `max_mcs`, and `checkpoint_interval_mcs`. Legacy attempt-based keys remain accepted with a warning and retain their old meaning.
 
@@ -101,7 +105,7 @@ round_trip_margin_fraction = 0.1
 
 If `smoothing_width` or `minimum_width` is zero, the automatic choice is recorded as zero in the configuration metadata while the final continuous energy ranges are recorded explicitly. A pilot should be long enough for ordinary windows to complete several trips. Windows with no completed trip receive the maximum configured difficulty penalty. Adaptation is deterministic for a fixed master seed.
 
-The program writes per-window CSV files, a stitched DOS with a within-run standard error across walkers, thermodynamic observables, and JSON metadata including exchange and forced acceptance. Each DOS CSV has a `valid` column; only bins visited by every walker in the corresponding window contribute to the combined DOS. A one-walker run reports `standard_error=nan`. This uncertainty describes dispersion inside one REWL run and does not replace an ensemble of independent master seeds. If a run stops with `converged=no`, it also writes `${output_prefix}_workers_stat.csv` with each walker's attempted flips and MCS, flip acceptance, forced-acceptance count, age of the last accepted flip in both units, final energy, modification factor, active-bin count, `min(H)/mean(H)`, and completed energy round trips. A checkpoint is supported for a single-window/single-walker run using `--checkpoint path`; its RNG state and forced-acceptance count are included.
+The program writes per-window CSV files, a stitched DOS with a within-run standard error across walkers, thermodynamic observables, and JSON metadata including exchange and forced acceptance. The original 1D validity rule remains unchanged: only bins visited by every walker in the corresponding window contribute. A one-walker run reports `standard_error=nan`. This uncertainty describes dispersion inside one REWL run and does not replace an ensemble of independent master seeds. If a run stops with `converged=no`, it also writes `${output_prefix}_workers_stat.csv` with each walker's attempted flips and MCS, flip acceptance, forced-acceptance count, age of the last accepted flip in both units, final energy, modification factor, active-bin count, `min(H)/mean(H)`, and completed energy round trips. WLCHKP5 checkpoint/restart is supported only for a single MPI process, single window, and single walker; it validates the complete E/Q layout and order-parameter weights before a transactional restore. Legacy checkpoints are accepted only in 1D with reduced layout verification.
 
 Use exact enumeration for small validation systems:
 

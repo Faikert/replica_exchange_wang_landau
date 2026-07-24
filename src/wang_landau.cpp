@@ -15,6 +15,11 @@ void EnergyGrid::validate() const {
         !std::isfinite(width) || !(maximum > minimum) || !(width > 0.0))
         throw std::invalid_argument("Invalid energy grid");
     const auto count = (maximum - minimum) / width;
+    const auto maximum_count=static_cast<long double>(std::min(
+        std::numeric_limits<std::size_t>::max(),
+        static_cast<std::size_t>(std::numeric_limits<long long>::max())));
+    if(!(count>=1.0) || static_cast<long double>(count)>maximum_count)
+        throw std::overflow_error("Energy grid has too many bins");
     if (std::abs(count - std::round(count)) > 1e-9 * std::max(1.0, count))
         throw std::invalid_argument("Energy range must be an integer multiple of bin width");
 }
@@ -42,6 +47,11 @@ void OrderParameterGrid::validate() const {
         !(maximum > minimum) || !(width > 0.0))
         throw std::invalid_argument("Invalid order-parameter grid");
     const auto count=(maximum-minimum)/width;
+    const auto maximum_count=static_cast<long double>(std::min(
+        std::numeric_limits<std::size_t>::max(),
+        static_cast<std::size_t>(std::numeric_limits<long long>::max())));
+    if(!(count>=1.0) || static_cast<long double>(count)>maximum_count)
+        throw std::overflow_error("Order-parameter grid has too many bins");
     if(std::abs(count-std::round(count))>1e-9*std::max(1.0,count))
         throw std::invalid_argument("Order-parameter range must be an integer multiple of bin width");
 }
@@ -115,10 +125,23 @@ WeightedOrderParameter WeightedOrderParameter::create(std::vector<double> weight
     const auto normalization=static_cast<double>(total);
     if(!(normalization>0.0)||!std::isfinite(normalization))
         throw std::invalid_argument("Order-parameter normalization must be finite and positive");
-    const auto half_bins=static_cast<std::size_t>(std::max(0.0,
-        std::ceil(normalization/bin_width-0.5-1e-12)));
-    const auto bin_count=2*half_bins+1;
-    const auto extent=0.5*static_cast<double>(bin_count)*bin_width;
+    const auto ratio=total/static_cast<long double>(bin_width);
+    const auto required=std::max(0.0L,std::ceil(ratio-0.5L));
+    const auto maximum_half=(std::numeric_limits<std::size_t>::max()-1)/2;
+    if(required>static_cast<long double>(maximum_half))
+        throw std::overflow_error("Order-parameter grid has too many bins");
+    auto half_bins=static_cast<std::size_t>(required);
+    auto bin_count=2*half_bins+1;
+    auto extent=0.5*static_cast<double>(bin_count)*bin_width;
+    if(!std::isfinite(extent)) throw std::overflow_error("Order-parameter grid extent overflows");
+    if(extent<normalization) {
+        if(half_bins==maximum_half) throw std::overflow_error("Order-parameter grid has too many bins");
+        ++half_bins;
+        bin_count=2*half_bins+1;
+        extent=0.5*static_cast<double>(bin_count)*bin_width;
+    }
+    if(!std::isfinite(extent)||extent<normalization)
+        throw std::overflow_error("Order-parameter grid cannot represent its full support");
     return {std::move(weights),normalization,{-extent,extent,bin_width}};
 }
 
@@ -554,10 +577,14 @@ void WangLandauWalker::freeze_if_finished() {
 
 WalkerSnapshot WangLandauWalker::snapshot() const {
     WalkerSnapshot result;
-    result.walker_id=id_; result.spins=spins_; result.fields=fields_; result.energy=energy_;
+    result.format_version=5; result.walker_id=id_; result.energy_grid=grid_;
+    result.energy_window=window_; result.spins=spins_; result.fields=fields_; result.energy=energy_;
     result.order_parameter=order_parameter_value_; result.joint_dos=dos_grid_.joint();
     if(dos_grid_.order_parameter) result.order_grid=*dos_grid_.order_parameter;
-    if(order_parameter_) result.order_normalization=order_parameter_->normalization;
+    if(order_parameter_) {
+        result.order_normalization=order_parameter_->normalization;
+        result.order_weights=order_parameter_->weights;
+    }
     result.log_g=log_g_; result.histogram=histogram_; result.active=active_;
     result.factor=factor_; result.attempted=attempted_; result.accepted=accepted_;
     result.forced_accepted=forced_accepted_; result.last_accepted_attempt=last_accepted_attempt_;
@@ -572,36 +599,87 @@ void WangLandauWalker::restore(const WalkerSnapshot& s) {
         s.histogram.size() != dos_grid_.cells() || s.active.size() != dos_grid_.cells() ||
         s.joint_dos!=dos_grid_.joint())
         throw std::invalid_argument("Checkpoint is incompatible with walker");
+    if(s.format_version==0||s.format_version>5)
+        throw std::invalid_argument("Checkpoint has an unsupported version");
+    if(s.format_version<5&&dos_grid_.joint())
+        throw std::invalid_argument("Legacy checkpoints cannot be restored in joint-DOS mode");
+    if(s.format_version>=5 &&
+       (s.energy_grid.minimum!=grid_.minimum||s.energy_grid.maximum!=grid_.maximum||
+        s.energy_grid.width!=grid_.width||s.energy_window.begin!=window_.begin||
+        s.energy_window.end!=window_.end))
+        throw std::invalid_argument("Checkpoint has an incompatible energy layout");
     if(dos_grid_.joint()) {
         const auto& grid=*dos_grid_.order_parameter;
         if(s.order_grid.minimum!=grid.minimum||s.order_grid.maximum!=grid.maximum||
            s.order_grid.width!=grid.width||!order_parameter_||
-           s.order_normalization!=order_parameter_->normalization)
+           s.order_normalization!=order_parameter_->normalization||
+           s.order_weights!=order_parameter_->weights)
             throw std::invalid_argument("Checkpoint has an incompatible order-parameter grid");
     }
-    if (s.last_accepted_attempt > s.attempted)
-        throw std::invalid_argument("Checkpoint has an invalid last accepted attempt");
-    if (s.forced_accepted > s.accepted)
+    if(s.accepted>s.attempted||s.last_accepted_attempt>s.attempted||
+       s.last_new_cell_attempt>s.attempted)
+        throw std::invalid_argument("Checkpoint has invalid attempt counters");
+    if(s.forced_accepted>s.accepted)
         throw std::invalid_argument("Checkpoint has an invalid forced acceptance count");
+    if(s.stage!=RefinementStage::wang_landau&&s.stage!=RefinementStage::inverse_time&&
+       s.stage!=RefinementStage::frozen)
+        throw std::invalid_argument("Checkpoint has an invalid refinement stage");
+    if(!std::isfinite(s.factor)||!(s.factor>0.0))
+        throw std::invalid_argument("Checkpoint has an invalid modification factor");
     if (!parameters_.inverse_time_enabled && s.stage == RefinementStage::inverse_time)
         throw std::invalid_argument("Checkpoint uses disabled inverse-time refinement");
-    spins_ = s.spins; fields_ = s.fields; energy_ = s.energy;
-    order_parameter_value_=s.order_parameter; log_g_ = s.log_g;
-    histogram_ = s.histogram; active_ = s.active; factor_ = s.factor;
-    attempted_ = s.attempted; accepted_ = s.accepted;
-    active_bin_count_=0;
-    if(parameters_.nalivaiko_mod) refinement_active_.assign(dos_grid_.cells(),0);
-    else refinement_active_.clear();
-    refinement_active_bin_count_=0;
+    if(!std::isfinite(s.energy)||!std::isfinite(s.order_parameter)||
+       std::any_of(s.log_g.begin(),s.log_g.end(),[](double value){return !std::isfinite(value);})||
+       std::all_of(s.rng_state.begin(),s.rng_state.end(),[](auto word){return word==0;}))
+        throw std::invalid_argument("Checkpoint contains non-finite state or an invalid RNG state");
+    for(const auto spin:s.spins)
+        if(spin!=-1&&spin!=1) throw std::invalid_argument("Checkpoint contains an invalid spin");
+    for(const auto value:s.active)
+        if(value>1) throw std::invalid_argument("Checkpoint contains an invalid active mask");
+
+    const auto exact=total_energy(*couplings_,s.spins);
+    if(std::abs(exact-s.energy)>1e-9*std::max(1.0,std::abs(exact)))
+        throw std::runtime_error("Checkpoint energy does not match spin configuration");
+    const auto exact_fields=local_fields(*couplings_,s.spins);
+    for(std::size_t i=0;i<s.fields.size();++i) {
+        if(!std::isfinite(s.fields[i])||
+           std::abs(exact_fields[i]-s.fields[i])>1e-9*std::max(1.0,std::abs(exact_fields[i])))
+            throw std::runtime_error("Checkpoint local fields do not match spin configuration");
+    }
+    if(order_parameter_) {
+        const auto exact_q=order_parameter_->evaluate(s.spins);
+        if(std::abs(exact_q-s.order_parameter)>1e-10*std::max(1.0,std::abs(exact_q)))
+            throw std::runtime_error("Checkpoint order parameter does not match spin configuration");
+    }
+    const auto state_bin=grid_.index(s.energy);
+    const auto state_cell=dos_grid_.index(s.energy,s.order_parameter);
+    if(!state_bin||!state_cell||!window_.contains(*state_bin))
+        throw std::runtime_error("Checkpoint state is outside the walker DOS window");
+
+    std::size_t active_count=0,refinement_count=0;
+    std::vector<std::uint8_t> refinement;
+    if(parameters_.nalivaiko_mod) refinement.assign(dos_grid_.cells(),0);
     const auto begin=dos_grid_.flatten(window_.begin),end=dos_grid_.flatten(window_.end);
     for(std::size_t i=begin;i<end;++i) {
-        active_[i]=active_[i]!=0?1:0;
-        active_bin_count_+=active_[i];
+        active_count+=s.active[i];
         if(parameters_.nalivaiko_mod) {
-            refinement_active_[i]=static_cast<std::uint8_t>(histogram_[i]!=0);
-            refinement_active_bin_count_+=refinement_active_[i];
+            refinement[i]=static_cast<std::uint8_t>(s.histogram[i]!=0);
+            refinement_count+=refinement[i];
         }
     }
+    for(std::size_t i=0;i<begin;++i)
+        if(s.active[i]!=0) throw std::invalid_argument("Checkpoint has active cells outside its window");
+    for(std::size_t i=end;i<s.active.size();++i)
+        if(s.active[i]!=0) throw std::invalid_argument("Checkpoint has active cells outside its window");
+
+    // Commit only after every compatibility and consistency check succeeds.
+    spins_=s.spins; fields_=s.fields; energy_=s.energy;
+    order_parameter_value_=s.order_parameter; log_g_=s.log_g;
+    histogram_=s.histogram; active_=s.active; factor_=s.factor;
+    attempted_=s.attempted; accepted_=s.accepted;
+    active_bin_count_=active_count;
+    refinement_active_=std::move(refinement);
+    refinement_active_bin_count_=refinement_count;
     forced_accepted_ = s.forced_accepted; last_accepted_attempt_ = s.last_accepted_attempt;
     last_new_cell_attempt_=s.last_new_cell_attempt; stage_ = s.stage;
     rng_.set_state(s.rng_state);
@@ -615,18 +693,6 @@ void WangLandauWalker::restore(const WalkerSnapshot& s) {
                   std::numeric_limits<double>::infinity());
         for(auto& representative:representatives_) representative.spins.clear();
         update_representatives();
-    }
-    const auto exact = total_energy(*couplings_, spins_);
-    if (std::abs(exact - energy_) > 1e-9 * std::max(1.0, std::abs(exact)))
-        throw std::runtime_error("Checkpoint energy does not match spin configuration");
-    const auto exact_fields = local_fields(*couplings_, spins_);
-    for (std::size_t i = 0; i < fields_.size(); ++i)
-        if (std::abs(exact_fields[i] - fields_[i]) > 1e-9 * std::max(1.0, std::abs(exact_fields[i])))
-            throw std::runtime_error("Checkpoint local fields do not match spin configuration");
-    if(order_parameter_) {
-        const auto exact_q=order_parameter_->evaluate(spins_);
-        if(std::abs(exact_q-order_parameter_value_)>1e-10*std::max(1.0,std::abs(exact_q)))
-            throw std::runtime_error("Checkpoint order parameter does not match spin configuration");
     }
 }
 

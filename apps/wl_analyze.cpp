@@ -13,7 +13,8 @@ wl::DosFragment read_fragment(const std::string& path,const wl::EnergyGrid& grid
     wl::DosFragment f{{grid.bins(),0},std::vector<double>(grid.bins(),nan),
                       std::vector<std::uint64_t>(grid.bins(),0),
                       std::vector<double>(grid.bins(),nan),
-                      std::vector<std::uint8_t>(grid.bins(),0)};
+                      std::vector<std::uint8_t>(grid.bins(),0),
+                      wl::DosGrid{grid,std::nullopt},{},{}};
     std::string line; std::getline(in,line);
     while(std::getline(in,line)) {
         std::stringstream row(line); std::string value; std::vector<std::string> fields;

@@ -22,8 +22,11 @@ int main(int argc,char** argv) {
             const auto exact=wl::exact_enumeration(*couplings,c.dos_grid(),*c.order_parameter);
             const auto joint=wl::stitch_joint_dos(c.dos_grid(),std::span(&exact,1),true,true,
                                                   geometry.size(),c.order_parameter->normalization);
-            wl::write_joint_dos_csv(c.output_prefix+"_exact2d.csv",joint);
-            wl::write_dos_csv(c.output_prefix+"_exact.csv",wl::marginalize(joint));
+            const auto marginal=wl::marginalize(joint);
+            wl::write_joint_dos_csv(c.output_prefix+"_dos2d.csv",joint);
+            wl::write_dos_csv(c.output_prefix+"_dos.csv",marginal);
+            wl::write_thermodynamics_csv(c.output_prefix+"_thermo.csv",
+                                         wl::thermodynamics(marginal,c.temperatures));
             wl::write_order_parameter_thermodynamics_csv(c.output_prefix+"_q_thermo.csv",
                 wl::order_parameter_thermodynamics(joint,c.temperatures,geometry.size()));
             wl::write_order_parameter_distribution_csv(c.output_prefix+"_q_distribution.csv",

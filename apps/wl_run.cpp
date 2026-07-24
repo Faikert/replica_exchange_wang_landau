@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <filesystem>
 #include <random>
 #include <vector>
@@ -35,7 +36,8 @@ int main(int argc,char** argv) {
     try {
         wl::ParallelContext parallel(argc,argv);
         for(int i=1;i<argc;++i) if(std::string_view(argv[i])=="--help"||std::string_view(argv[i])=="-h") {
-            if(parallel.rank()==0) std::cout<<wl::usage(argv[0]); return 0;
+            if(parallel.rank()==0) std::cout<<wl::usage(argv[0]);
+            return 0;
         }
         auto config=wl::parse_arguments(argc,argv);
         if(!config.seed_explicit&&parallel.rank()==0) config.seed=random_seed();
@@ -74,8 +76,11 @@ int main(int argc,char** argv) {
                      <<config.wl.initialization_max_temperature_fraction
                      <<" progress_interval_seconds="<<config.progress_interval_seconds<<'\n';
             const auto layout=config.dos_grid();
-            const auto bytes_per_walker=layout.cells()*(sizeof(double)+sizeof(std::uint64_t)+
-                sizeof(std::uint8_t)*(config.wl.nalivaiko_mod?2:1));
+            const auto bytes_per_cell=sizeof(double)+sizeof(std::uint64_t)+
+                sizeof(std::uint8_t)*(config.wl.nalivaiko_mod?2:1);
+            if(layout.cells()>std::numeric_limits<std::size_t>::max()/bytes_per_cell)
+                throw std::overflow_error("DOS memory estimate overflows size_t");
+            const auto bytes_per_walker=layout.cells()*bytes_per_cell;
             std::cout<<"dos_dimensions="<<(layout.joint()?2:1)<<" dos_cells="<<layout.cells()
                      <<" approximate_core_bytes_per_walker="<<bytes_per_walker<<'\n';
             if(config.uses_legacy_attempt_units())
@@ -134,7 +139,11 @@ int main(int argc,char** argv) {
                 if(parallel.rank()==0) {
                     auto adaptive_fragments=pilot_result.fragments;
                     if(config.order_parameter)
-                        for(auto& fragment:adaptive_fragments) fragment=wl::marginalize_fragment(fragment);
+                        for(auto& fragment:adaptive_fragments) {
+                            const auto components=wl::support_component_count(fragment);
+                            if(components!=1) throw wl::DisconnectedSupportError(components);
+                            fragment=wl::marginalize_fragment(fragment);
+                        }
                     windows=wl::adapt_energy_windows(config.grid,adaptive_fragments,
                         pilot_result.sampling_statistics,config.windows,config.overlap,
                         config.adaptive_windows);
@@ -185,24 +194,44 @@ int main(int argc,char** argv) {
         const auto result=wl::run_rewl(parallel,couplings,config);
         const auto elapsed_seconds=
             std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+        bool postprocessing_failed=false;
         if(parallel.rank()==0) {
+            std::string postprocessing_status=result.converged?"complete":"nonconverged";
             if(config.order_parameter) {
-                const auto joint=wl::stitch_joint_dos(config.dos_grid(),result.fragments,
-                    config.complete_range,result.converged,geometry.size(),
-                    config.order_parameter->normalization);
-                const auto dos=wl::marginalize(joint);
-                wl::write_joint_dos_csv(config.output_prefix+"_dos2d.csv",joint);
-                wl::write_dos_csv(config.output_prefix+"_dos.csv",dos);
-                wl::write_thermodynamics_csv(config.output_prefix+"_thermo.csv",
-                                             wl::thermodynamics(dos,config.temperatures));
-                wl::write_order_parameter_thermodynamics_csv(config.output_prefix+"_q_thermo.csv",
-                    wl::order_parameter_thermodynamics(joint,config.temperatures,geometry.size()));
-                wl::write_order_parameter_distribution_csv(config.output_prefix+"_q_distribution.csv",
-                    wl::order_parameter_distribution(joint,config.temperatures));
                 for(std::size_t i=0;i<result.fragments.size();++i)
                     wl::write_joint_fragment_csv(config.output_prefix+"_window_"+
                         std::to_string(i)+"_dos2d.csv",result.fragments[i],
                         config.order_parameter->normalization,i);
+                std::optional<wl::JointDensityOfStates> joint;
+                try {
+                    joint=wl::stitch_joint_dos(config.dos_grid(),result.fragments,
+                        config.complete_range,result.converged,geometry.size(),
+                        config.order_parameter->normalization);
+                } catch(const wl::DisconnectedSupportError& error) {
+                    postprocessing_status="disconnected_support";
+                    postprocessing_failed=result.converged;
+                    std::cerr<<"warning: "<<error.what()
+                             <<"; joint DOS observables were not written\n";
+                }
+                wl::write_metadata_json(config.output_prefix+"_metadata.json",config,*couplings,
+                                        result.attempted,result.accepted,result.forced_accepted,
+                                        result.exchange_attempted,result.exchange_accepted,
+                                        result.converged,parallel.size(),wl::maximum_openmp_threads(),
+                                        postprocessing_status);
+                if(!result.converged||!joint)
+                    wl::write_workers_stat_csv(config.output_prefix+"_workers_stat.csv",
+                                               result.walker_statistics,geometry.size());
+                if(joint) {
+                    const auto dos=wl::marginalize(*joint);
+                    wl::write_joint_dos_csv(config.output_prefix+"_dos2d.csv",*joint);
+                    wl::write_dos_csv(config.output_prefix+"_dos.csv",dos);
+                    wl::write_thermodynamics_csv(config.output_prefix+"_thermo.csv",
+                                                 wl::thermodynamics(dos,config.temperatures));
+                    wl::write_order_parameter_thermodynamics_csv(config.output_prefix+"_q_thermo.csv",
+                        wl::order_parameter_thermodynamics(*joint,config.temperatures,geometry.size()));
+                    wl::write_order_parameter_distribution_csv(config.output_prefix+"_q_distribution.csv",
+                        wl::order_parameter_distribution(*joint,config.temperatures));
+                }
             } else {
                 const auto dos=wl::stitch_dos(config.grid,result.fragments,config.complete_range,geometry.size());
                 wl::write_dos_csv(config.output_prefix+"_dos.csv",dos);
@@ -211,14 +240,15 @@ int main(int argc,char** argv) {
                 for(std::size_t i=0;i<result.fragments.size();++i)
                     wl::write_fragment_csv(config.output_prefix+"_window_"+std::to_string(i)+".csv",
                                            config.grid,result.fragments[i],i);
+                wl::write_metadata_json(config.output_prefix+"_metadata.json",config,*couplings,
+                                        result.attempted,result.accepted,result.forced_accepted,
+                                        result.exchange_attempted,result.exchange_accepted,
+                                        result.converged,parallel.size(),wl::maximum_openmp_threads(),
+                                        postprocessing_status);
+                if(!result.converged)
+                    wl::write_workers_stat_csv(config.output_prefix+"_workers_stat.csv",
+                                               result.walker_statistics,geometry.size());
             }
-            wl::write_metadata_json(config.output_prefix+"_metadata.json",config,*couplings,
-                                    result.attempted,result.accepted,result.forced_accepted,result.exchange_attempted,
-                                    result.exchange_accepted,result.converged,
-                                    parallel.size(),wl::maximum_openmp_threads());
-            if(!result.converged)
-                wl::write_workers_stat_csv(config.output_prefix+"_workers_stat.csv",
-                                           result.walker_statistics,geometry.size());
             std::cout<<"attempted_flips="<<result.attempted
                      <<" aggregate_mcs="<<static_cast<double>(result.attempted)/static_cast<double>(geometry.size())
                      <<" accepted="<<result.accepted
@@ -230,6 +260,7 @@ int main(int argc,char** argv) {
                 std::cerr<<"warning: max-mcs reached before final factor; walker statistics written to "
                          <<config.output_prefix<<"_workers_stat.csv\n";
         }
+        if(postprocessing_failed) return 1;
         return result.converged||config.smoke_test?0:2;
     } catch(const std::exception& error) {
         std::cerr<<"wl_run: "<<error.what()<<'\n'; return 1;

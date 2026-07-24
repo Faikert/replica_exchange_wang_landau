@@ -64,14 +64,17 @@ Geometry Geometry::simple_cubic(std::size_t nx, std::size_t ny, std::size_t nz,
     if (nx == 0 || ny == 0 || nz == 0 || !(spacing > 0.0))
         throw std::invalid_argument("Invalid simple-cubic dimensions or spacing");
     Geometry result;
-    result.box = {{nx*spacing, ny*spacing, nz*spacing}, periodic};
+    result.box = {{static_cast<double>(nx)*spacing,static_cast<double>(ny)*spacing,
+                   static_cast<double>(nz)*spacing}, periodic};
     axis = normalized(axis);
     result.positions.reserve(nx*ny*nz);
     result.axes.reserve(nx*ny*nz);
     for (std::size_t z = 0; z < nz; ++z)
         for (std::size_t y = 0; y < ny; ++y)
             for (std::size_t x = 0; x < nx; ++x) {
-                result.positions.push_back({x*spacing, y*spacing, z*spacing});
+                result.positions.push_back({static_cast<double>(x)*spacing,
+                                            static_cast<double>(y)*spacing,
+                                            static_cast<double>(z)*spacing});
                 result.axes.push_back(axis);
             }
     result.validate();
