@@ -82,7 +82,9 @@ int main(int argc,char** argv) {
                 throw std::overflow_error("DOS memory estimate overflows size_t");
             const auto bytes_per_walker=layout.cells()*bytes_per_cell;
             std::cout<<"dos_dimensions="<<(layout.joint()?2:1)<<" dos_cells="<<layout.cells()
-                     <<" approximate_core_bytes_per_walker="<<bytes_per_walker<<'\n';
+                     <<" approximate_core_bytes_per_walker="<<bytes_per_walker<<'\n'
+                     <<"output_prefix_absolute="
+                     <<std::filesystem::absolute(config.output_prefix).string()<<'\n';
             if(config.uses_legacy_attempt_units())
                 std::cerr<<"warning: legacy attempt-based interval option used; prefer the corresponding *_mcs option\n";
             if(!config.pilot && config.wl.force_accept_after_attempts!=0)
@@ -197,12 +199,9 @@ int main(int argc,char** argv) {
         bool postprocessing_failed=false;
         if(parallel.rank()==0) {
             std::string postprocessing_status=result.converged?"complete":"nonconverged";
+            std::optional<wl::JointDensityOfStates> joint;
+            std::optional<wl::DensityOfStates> dos;
             if(config.order_parameter) {
-                for(std::size_t i=0;i<result.fragments.size();++i)
-                    wl::write_joint_fragment_csv(config.output_prefix+"_window_"+
-                        std::to_string(i)+"_dos2d.csv",result.fragments[i],
-                        config.order_parameter->normalization,i);
-                std::optional<wl::JointDensityOfStates> joint;
                 try {
                     joint=wl::stitch_joint_dos(config.dos_grid(),result.fragments,
                         config.complete_range,result.converged,geometry.size(),
@@ -212,42 +211,66 @@ int main(int argc,char** argv) {
                     postprocessing_failed=result.converged;
                     std::cerr<<"warning: "<<error.what()
                              <<"; joint DOS observables were not written\n";
+                } catch(const std::exception& error) {
+                    postprocessing_status="postprocessing_error";
+                    postprocessing_failed=true;
+                    std::cerr<<"warning: joint DOS postprocessing failed: "<<error.what()
+                             <<"; raw diagnostics will still be written\n";
                 }
-                wl::write_metadata_json(config.output_prefix+"_metadata.json",config,*couplings,
-                                        result.attempted,result.accepted,result.forced_accepted,
-                                        result.exchange_attempted,result.exchange_accepted,
-                                        result.converged,parallel.size(),wl::maximum_openmp_threads(),
-                                        postprocessing_status);
-                if(!result.converged||!joint)
-                    wl::write_workers_stat_csv(config.output_prefix+"_workers_stat.csv",
-                                               result.walker_statistics,geometry.size());
+            } else {
+                try {
+                    dos=wl::stitch_dos(config.grid,result.fragments,config.complete_range,
+                                       geometry.size());
+                } catch(const wl::InsufficientSupportError& error) {
+                    postprocessing_status="insufficient_support";
+                    postprocessing_failed=result.converged;
+                    std::cerr<<"warning: "<<error.what()
+                             <<"; global DOS observables were not written\n";
+                } catch(const std::exception& error) {
+                    postprocessing_status="postprocessing_error";
+                    postprocessing_failed=true;
+                    std::cerr<<"warning: DOS postprocessing failed: "<<error.what()
+                             <<"; raw diagnostics will still be written\n";
+                }
+            }
+
+            // Write the small diagnostic files before raw fragments and derived observables.
+            // A later CSV or postprocessing failure can no longer leave a completed run silent.
+            wl::write_metadata_json(config.output_prefix+"_metadata.json",config,*couplings,
+                                    result.attempted,result.accepted,result.forced_accepted,
+                                    result.exchange_attempted,result.exchange_accepted,
+                                    result.converged,parallel.size(),wl::maximum_openmp_threads(),
+                                    postprocessing_status);
+            const bool no_global_dos=config.order_parameter?!joint:!dos;
+            if(!result.converged||no_global_dos)
+                wl::write_workers_stat_csv(config.output_prefix+"_workers_stat.csv",
+                                           result.walker_statistics,geometry.size());
+
+            if(config.order_parameter) {
+                for(std::size_t i=0;i<result.fragments.size();++i)
+                    wl::write_joint_fragment_csv(config.output_prefix+"_window_"+
+                        std::to_string(i)+"_dos2d.csv",result.fragments[i],
+                        config.order_parameter->normalization,i);
                 if(joint) {
-                    const auto dos=wl::marginalize(*joint);
+                    dos=wl::marginalize(*joint);
                     wl::write_joint_dos_csv(config.output_prefix+"_dos2d.csv",*joint);
-                    wl::write_dos_csv(config.output_prefix+"_dos.csv",dos);
+                    wl::write_dos_csv(config.output_prefix+"_dos.csv",*dos);
                     wl::write_thermodynamics_csv(config.output_prefix+"_thermo.csv",
-                                                 wl::thermodynamics(dos,config.temperatures));
+                                                 wl::thermodynamics(*dos,config.temperatures));
                     wl::write_order_parameter_thermodynamics_csv(config.output_prefix+"_q_thermo.csv",
                         wl::order_parameter_thermodynamics(*joint,config.temperatures,geometry.size()));
                     wl::write_order_parameter_distribution_csv(config.output_prefix+"_q_distribution.csv",
                         wl::order_parameter_distribution(*joint,config.temperatures));
                 }
             } else {
-                const auto dos=wl::stitch_dos(config.grid,result.fragments,config.complete_range,geometry.size());
-                wl::write_dos_csv(config.output_prefix+"_dos.csv",dos);
-                wl::write_thermodynamics_csv(config.output_prefix+"_thermo.csv",
-                                             wl::thermodynamics(dos,config.temperatures));
                 for(std::size_t i=0;i<result.fragments.size();++i)
                     wl::write_fragment_csv(config.output_prefix+"_window_"+std::to_string(i)+".csv",
                                            config.grid,result.fragments[i],i);
-                wl::write_metadata_json(config.output_prefix+"_metadata.json",config,*couplings,
-                                        result.attempted,result.accepted,result.forced_accepted,
-                                        result.exchange_attempted,result.exchange_accepted,
-                                        result.converged,parallel.size(),wl::maximum_openmp_threads(),
-                                        postprocessing_status);
-                if(!result.converged)
-                    wl::write_workers_stat_csv(config.output_prefix+"_workers_stat.csv",
-                                               result.walker_statistics,geometry.size());
+                if(dos) {
+                    wl::write_dos_csv(config.output_prefix+"_dos.csv",*dos);
+                    wl::write_thermodynamics_csv(config.output_prefix+"_thermo.csv",
+                                                 wl::thermodynamics(*dos,config.temperatures));
+                }
             }
             std::cout<<"attempted_flips="<<result.attempted
                      <<" aggregate_mcs="<<static_cast<double>(result.attempted)/static_cast<double>(geometry.size())

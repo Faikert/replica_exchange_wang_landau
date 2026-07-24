@@ -183,7 +183,8 @@ DosFragment summarize_impl(EnergyWindow window,
     if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(end) && allow_empty_intersection)
         return f;
     if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(end))
-        throw std::runtime_error("Walkers in an energy window have no common active bin");
+        throw InsufficientSupportError(
+            "Walkers in an energy window have no common active bin");
     const auto reference_bin=static_cast<std::size_t>(reference-f.valid.begin());
     for(std::size_t i=begin;i<end;++i) {
         if(f.valid[i]==0) continue;
@@ -418,7 +419,8 @@ DosFragment summarize_distributed(EnergyWindow window,
     if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(end) && allow_empty_intersection)
         return f;
     if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(end))
-        throw std::runtime_error("Walkers in an MPI energy window have no common active bin");
+        throw InsufficientSupportError(
+            "Walkers in an MPI energy window have no common active bin");
     const auto reference_bin=static_cast<std::size_t>(reference-f.valid.begin());
     std::uint64_t local_count=static_cast<std::uint64_t>(walkers.size()),walker_count=0;
     MPI_Allreduce(&local_count,&walker_count,1,MPI_UINT64_T,MPI_SUM,communicator);
@@ -902,7 +904,7 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
         if(distributed) {
             result.fragments.push_back(summarize_distributed(windows[w],groups[w],c.grid.bins(),
                                                              window_comm,
-                                                             c.wl.collect_window_statistics));
+                                                             true));
             if(c.wl.collect_window_statistics)
                 result.sampling_statistics.push_back(summarize_sampling_distributed(
                     windows[w],groups[w],c.grid.bins(),window_comm));
@@ -913,7 +915,7 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
             pointers.reserve(groups[w].size());
             for(const auto& walker:groups[w]) pointers.push_back(walker.get());
             result.fragments.push_back(summarize_walkers(windows[w],pointers,c.grid.bins(),
-                                                         c.wl.collect_window_statistics));
+                                                         true));
             if(c.wl.collect_window_statistics)
                 result.sampling_statistics.push_back(summarize_sampling_impl(
                     windows[w],pointers,c.grid.bins()));

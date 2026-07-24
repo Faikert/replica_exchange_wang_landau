@@ -91,7 +91,8 @@ DensityOfStates stitch_dos(EnergyGrid grid, std::span<const DosFragment> input,
                 if(distance<midpoint_distance) { midpoint_distance=distance; join=i; }
             }
         if(join==overlap_end)
-            throw std::runtime_error("Adjacent DOS fragments have no common valid overlap bin");
+            throw InsufficientSupportError(
+                "Adjacent DOS fragments have no common valid overlap bin");
         auto best = std::numeric_limits<double>::infinity();
         for (auto i = overlap_begin + 2; i + 2 < overlap_end; ++i) {
             if(result.valid[i]==0||right.valid[i]==0) continue;
@@ -119,14 +120,16 @@ DensityOfStates stitch_dos(EnergyGrid grid, std::span<const DosFragment> input,
     }
     if (complete_range) {
         if(std::any_of(result.valid.begin(),result.valid.end(),[](const auto value){return value==0;}))
-            throw std::runtime_error("Complete-range normalization requires every DOS bin to be valid");
+            throw InsufficientSupportError(
+                "Complete-range normalization requires every DOS bin to be valid");
         const auto normalization = static_cast<double>(spin_count) * std::log(2.0) -
                                    log_sum_exp(result.log_g);
         for(std::size_t i=0;i<bins;++i) if(result.valid[i]!=0) result.log_g[i]+=normalization;
         result.fully_normalized = true;
     } else {
         const auto maximum=log_sum_exp(result.log_g);
-        if(!std::isfinite(maximum)) throw std::runtime_error("Stitched DOS has no valid bins");
+        if(!std::isfinite(maximum))
+            throw InsufficientSupportError("Stitched DOS has no valid bins");
         auto peak=-std::numeric_limits<double>::infinity();
         for(std::size_t i=0;i<bins;++i) if(result.valid[i]!=0) peak=std::max(peak,result.log_g[i]);
         for(std::size_t i=0;i<bins;++i) if(result.valid[i]!=0) result.log_g[i]-=peak;

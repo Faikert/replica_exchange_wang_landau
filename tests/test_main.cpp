@@ -1028,6 +1028,18 @@ void test_classic_rewl_independence_and_summary() {
     try { (void)wl::summarize_walkers(window,walkers,grid.bins()); }
     catch(const std::runtime_error&) { rejected=true; }
     require(rejected,"summary must reject walkers without a common active bin");
+    const auto diagnostic_fragment=
+        wl::summarize_walkers(window,walkers,grid.bins(),true);
+    require(std::none_of(diagnostic_fragment.valid.begin(),diagnostic_fragment.valid.end(),
+                         [](auto value){return value!=0;}),
+            "diagnostic summary preserves an empty intersection for output");
+    bool insufficient=false;
+    try {
+        (void)wl::stitch_dos(grid,std::span(&diagnostic_fragment,1),false,1);
+    } catch(const wl::InsufficientSupportError&) {
+        insufficient=true;
+    }
+    require(insufficient,"empty diagnostic support has a typed postprocessing status");
 }
 }
 

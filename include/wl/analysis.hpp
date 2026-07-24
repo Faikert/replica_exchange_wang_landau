@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace wl {
@@ -69,6 +70,12 @@ public:
     [[nodiscard]] std::size_t components() const noexcept { return components_; }
 private:
     std::size_t components_{};
+};
+
+class InsufficientSupportError : public std::runtime_error {
+public:
+    explicit InsufficientSupportError(const std::string& message)
+        : std::runtime_error(message) {}
 };
 
 struct OrderParameterThermodynamicPoint {
