@@ -417,6 +417,120 @@ void test_exact_enumeration_and_thermo() {
             "relative thermodynamics ignores invalid bins");
 }
 
+void test_joint_dos_and_order_parameter() {
+    const auto directory=std::filesystem::temp_directory_path()/"wl_joint_dos_test";
+    std::filesystem::create_directories(directory);
+    const auto csv=directory/"weighted.csv";
+    { std::ofstream out(csv); out<<"x,y,z,mx,my,mz,q_weight\n"
+        <<"0,0,0,0,0,1,1\n1,0,0,0,0,1,-1\n"; }
+    const auto geometry=wl::Geometry::load_csv(csv.string(),{{0,0,0},false});
+    require(geometry.order_weights==std::vector<double>({1.0,-1.0}),"CSV q_weight values");
+    std::vector<std::string> arguments{"test","--geometry",csv.string(),"--emin","-4",
+        "--emax","4","--bin-width","0.5","--order-parameter","weighted_sum",
+        "--q-bin-width","1","--support-stability-checks","3"};
+    std::vector<char*> argv; for(auto& argument:arguments) argv.push_back(argument.data());
+    auto config=wl::parse_arguments(static_cast<int>(argv.size()),argv.data());
+    config.resolve_order_parameter(geometry); config.resolve_mcs(geometry.size()); config.validate();
+    require(config.order_parameter&&config.wl.support_stability_checks==3,
+            "CLI weighted order-parameter configuration");
+    const auto order=wl::WeightedOrderParameter::create(geometry.order_weights,1.0);
+    near(order.normalization,2.0,1e-14,"Q normalization");
+    require(order.grid.bins()%2==1&&order.grid.index(-2.0)&&order.grid.index(2.0),
+            "symmetric Q grid includes extrema");
+    const std::vector<std::int8_t> spins{1,-1};
+    near(order.evaluate(spins),2.0,1e-14,"weighted Q evaluation");
+    near(order.flip_delta(0,spins[0]),-2.0,1e-14,"incremental Q delta");
+
+    const wl::EnergyGrid energy_grid{-4,4,0.5};
+    const wl::DosGrid grid{energy_grid,order.grid};
+    require(grid.cells()==energy_grid.bins()*order.grid.bins(),"joint grid cell count");
+    for(std::size_t e=0;e<grid.energy_bins();++e)
+        for(std::size_t q=0;q<grid.q_bins();++q) {
+            const auto cell=grid.flatten(e,q);
+            require(grid.energy_bin(cell)==e&&grid.q_bin(cell)==q,"joint flatten round trip");
+        }
+
+    auto couplings=std::make_shared<wl::DenseCouplings>(geometry,1.0);
+    const auto exact=wl::exact_enumeration(*couplings,grid,order);
+    require(std::accumulate(exact.histogram.begin(),exact.histogram.end(),std::uint64_t{0})==4,
+            "joint exact state count");
+    for(std::size_t e=0;e<grid.energy_bins();++e)
+        for(std::size_t q=0;q<grid.q_bins();++q)
+            require(exact.histogram[grid.flatten(e,q)]==
+                    exact.histogram[grid.flatten(e,grid.q_bins()-1-q)],
+                    "global spin inversion gives g(E,Q)=g(E,-Q)");
+    const auto joint=wl::stitch_joint_dos(grid,std::span(&exact,1),true,true,2,order.normalization);
+    double state_sum=0.0;
+    for(std::size_t i=0;i<joint.log_g.size();++i)
+        if(joint.valid[i]&&std::isfinite(joint.log_g[i])) state_sum+=std::exp(joint.log_g[i]);
+    near(state_sum,4.0,1e-13,"joint complete normalization");
+    const auto marginal=wl::marginalize(joint);
+    const auto direct=wl::exact_enumeration(*couplings,energy_grid);
+    require(marginal.histogram==direct.histogram,"joint marginal histogram equals direct energy DOS");
+    const std::array<double,2> temperatures{1.0,2.0};
+    const auto q_thermo=wl::order_parameter_thermodynamics(joint,temperatures,2);
+    require(q_thermo.size()==2&&std::isfinite(q_thermo[0].susceptibility)&&
+            std::isfinite(q_thermo[0].binder_cumulant),"finite Q thermodynamics");
+    const auto distribution=wl::order_parameter_distribution(joint,temperatures);
+    for(std::size_t t=0;t<temperatures.size();++t) {
+        double probability=0.0;
+        for(std::size_t q=0;q<grid.q_bins();++q)
+            probability+=distribution[t*grid.q_bins()+q].probability;
+        near(probability,1.0,1e-13,"normalized Q distribution");
+    }
+
+    auto order_ptr=std::make_shared<wl::WeightedOrderParameter>(order);
+    wl::WlParameters parameters; parameters.check_interval_attempts=1;
+    parameters.support_stability_checks=1;
+    wl::WangLandauWalker walker(31,couplings,grid,{0,grid.energy_bins()},parameters,77,
+                                order_ptr,spins);
+    auto rejected=walker.snapshot();
+    std::fill(rejected.log_g.begin(),rejected.log_g.end(),1000.0);
+    const auto rejected_cell=grid.index(rejected.energy,rejected.order_parameter);
+    require(rejected_cell.has_value(),"current joint cell before rejection");
+    rejected.log_g[*rejected_cell]=0.0;
+    const auto visits_before=rejected.histogram[*rejected_cell];
+    walker.restore(rejected);
+    require(!walker.attempt_flip()&&walker.order_parameter()==rejected.order_parameter,
+            "rejected joint flip preserves Q");
+    require(walker.histogram()[*rejected_cell]==visits_before+1,
+            "rejected joint flip updates current cell");
+    for(int step=0;step<50;++step) {
+        walker.attempt_flip();
+        near(walker.order_parameter(),order.evaluate(walker.snapshot().spins),1e-13,
+             "incremental walker Q");
+    }
+    const auto checkpoint=directory/"joint.chk";
+    wl::save_checkpoint(checkpoint.string(),walker.snapshot());
+    wl::WangLandauWalker restored(31,couplings,grid,{0,grid.energy_bins()},parameters,77,
+                                  order_ptr,spins);
+    restored.restore(wl::load_checkpoint(checkpoint.string()));
+    near(restored.order_parameter(),walker.order_parameter(),1e-14,"joint checkpoint Q");
+    require(restored.log_g()==walker.log_g()&&restored.histogram()==walker.histogram(),
+            "joint checkpoint estimator");
+    const auto walker_accept=walker.attempt_flip();
+    const auto restored_accept=restored.attempt_flip();
+    require(walker_accept==restored_accept&&walker.snapshot().spins==restored.snapshot().spins&&
+            walker.log_g()==restored.log_g()&&walker.histogram()==restored.histogram(),
+            "joint checkpoint deterministic continuation");
+
+    auto single_couplings=std::make_shared<wl::DenseCouplings>(
+        wl::Geometry::simple_cubic(1,1,1,1.0,{0,0,1},false),1.0);
+    auto single_order=std::make_shared<wl::WeightedOrderParameter>(
+        wl::WeightedOrderParameter::create(std::vector<double>{1.0},1.0));
+    const wl::DosGrid single_grid{{-1,1,0.5},single_order->grid};
+    wl::WlParameters stable; stable.inverse_time_enabled=false; stable.flatness=0.1;
+    stable.minimum_visits=1; stable.check_interval_attempts=1; stable.support_stability_checks=1;
+    wl::WangLandauWalker stability(32,single_couplings,single_grid,
+        {0,single_grid.energy_bins()},stable,9,single_order,std::vector<std::int8_t>{1});
+    stability.attempt_flip();
+    require(stability.flat()&&!stability.ready_for_iteration(),
+            "new joint cell resets support-stability clock");
+    stability.attempt_flip();
+    require(stability.ready_for_iteration(),"stable active joint support permits next iteration");
+    std::filesystem::remove_all(directory);
+}
+
 void test_adaptive_energy_windows() {
     wl::EnergyGrid grid{-10.0,10.0,0.5};
     const auto initial=wl::partition_windows(grid.bins(),4,0.5);
@@ -788,6 +902,7 @@ int main() {
       {"classic_rewl_independence_summary",test_classic_rewl_independence_and_summary},
       {"unlimited_max_attempts",test_unlimited_max_attempts},
       {"exact_thermo",test_exact_enumeration_and_thermo},
+      {"joint_dos_order_parameter",test_joint_dos_and_order_parameter},
       {"adaptive_energy_windows",test_adaptive_energy_windows}};
     int failed=0;
     for(const auto& [name,test]:tests) try { test(); std::cout<<"PASS "<<name<<'\n'; }

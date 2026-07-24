@@ -49,6 +49,7 @@ int main(int argc,char** argv) {
             geometry=wl::Geometry::load_csv(config.geometry_file,{config.box_lengths,config.periodic});
         else
             geometry=wl::Geometry::load_xyz_axes(config.geometry_file,{config.box_lengths,config.periodic});
+        config.resolve_order_parameter(geometry);
         config.resolve_mcs(geometry.size());
         config.validate(!config.smoke_test&&!config.pilot);
         if(config.pilot && config.max_attempts==0)
@@ -72,6 +73,11 @@ int main(int argc,char** argv) {
                      <<" initialization_max_temperature_fraction="
                      <<config.wl.initialization_max_temperature_fraction
                      <<" progress_interval_seconds="<<config.progress_interval_seconds<<'\n';
+            const auto layout=config.dos_grid();
+            const auto bytes_per_walker=layout.cells()*(sizeof(double)+sizeof(std::uint64_t)+
+                sizeof(std::uint8_t)*(config.wl.nalivaiko_mod?2:1));
+            std::cout<<"dos_dimensions="<<(layout.joint()?2:1)<<" dos_cells="<<layout.cells()
+                     <<" approximate_core_bytes_per_walker="<<bytes_per_walker<<'\n';
             if(config.uses_legacy_attempt_units())
                 std::cerr<<"warning: legacy attempt-based interval option used; prefer the corresponding *_mcs option\n";
             if(!config.pilot && config.wl.force_accept_after_attempts!=0)
@@ -126,7 +132,10 @@ int main(int argc,char** argv) {
                 const auto pilot_result=wl::run_rewl(parallel,couplings,pilot_config);
                 std::vector<std::vector<std::int8_t>> next_initial_configurations;
                 if(parallel.rank()==0) {
-                    windows=wl::adapt_energy_windows(config.grid,pilot_result.fragments,
+                    auto adaptive_fragments=pilot_result.fragments;
+                    if(config.order_parameter)
+                        for(auto& fragment:adaptive_fragments) fragment=wl::marginalize_fragment(fragment);
+                    windows=wl::adapt_energy_windows(config.grid,adaptive_fragments,
                         pilot_result.sampling_statistics,config.windows,config.overlap,
                         config.adaptive_windows);
                     std::uint64_t round_trips=0;
@@ -177,13 +186,32 @@ int main(int argc,char** argv) {
         const auto elapsed_seconds=
             std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
         if(parallel.rank()==0) {
-            const auto dos=wl::stitch_dos(config.grid,result.fragments,config.complete_range,geometry.size());
-            wl::write_dos_csv(config.output_prefix+"_dos.csv",dos);
-            wl::write_thermodynamics_csv(config.output_prefix+"_thermo.csv",
-                                         wl::thermodynamics(dos,config.temperatures));
-            for(std::size_t i=0;i<result.fragments.size();++i)
-                wl::write_fragment_csv(config.output_prefix+"_window_"+std::to_string(i)+".csv",
-                                       config.grid,result.fragments[i],i);
+            if(config.order_parameter) {
+                const auto joint=wl::stitch_joint_dos(config.dos_grid(),result.fragments,
+                    config.complete_range,result.converged,geometry.size(),
+                    config.order_parameter->normalization);
+                const auto dos=wl::marginalize(joint);
+                wl::write_joint_dos_csv(config.output_prefix+"_dos2d.csv",joint);
+                wl::write_dos_csv(config.output_prefix+"_dos.csv",dos);
+                wl::write_thermodynamics_csv(config.output_prefix+"_thermo.csv",
+                                             wl::thermodynamics(dos,config.temperatures));
+                wl::write_order_parameter_thermodynamics_csv(config.output_prefix+"_q_thermo.csv",
+                    wl::order_parameter_thermodynamics(joint,config.temperatures,geometry.size()));
+                wl::write_order_parameter_distribution_csv(config.output_prefix+"_q_distribution.csv",
+                    wl::order_parameter_distribution(joint,config.temperatures));
+                for(std::size_t i=0;i<result.fragments.size();++i)
+                    wl::write_joint_fragment_csv(config.output_prefix+"_window_"+
+                        std::to_string(i)+"_dos2d.csv",result.fragments[i],
+                        config.order_parameter->normalization,i);
+            } else {
+                const auto dos=wl::stitch_dos(config.grid,result.fragments,config.complete_range,geometry.size());
+                wl::write_dos_csv(config.output_prefix+"_dos.csv",dos);
+                wl::write_thermodynamics_csv(config.output_prefix+"_thermo.csv",
+                                             wl::thermodynamics(dos,config.temperatures));
+                for(std::size_t i=0;i<result.fragments.size();++i)
+                    wl::write_fragment_csv(config.output_prefix+"_window_"+std::to_string(i)+".csv",
+                                           config.grid,result.fragments[i],i);
+            }
             wl::write_metadata_json(config.output_prefix+"_metadata.json",config,*couplings,
                                     result.attempted,result.accepted,result.forced_accepted,result.exchange_attempted,
                                     result.exchange_accepted,result.converged,

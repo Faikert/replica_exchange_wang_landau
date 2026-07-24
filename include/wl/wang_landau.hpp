@@ -25,6 +25,46 @@ struct EnergyGrid {
     [[nodiscard]] double center(std::size_t index) const noexcept;
 };
 
+struct OrderParameterGrid {
+    double minimum{};
+    double maximum{};
+    double width{};
+
+    void validate() const;
+    [[nodiscard]] std::size_t bins() const;
+    [[nodiscard]] std::optional<std::size_t> index(double value) const noexcept;
+    [[nodiscard]] double center(std::size_t index) const noexcept;
+};
+
+struct DosGrid {
+    EnergyGrid energy;
+    std::optional<OrderParameterGrid> order_parameter;
+
+    void validate() const;
+    [[nodiscard]] bool joint() const noexcept { return order_parameter.has_value(); }
+    [[nodiscard]] std::size_t energy_bins() const { return energy.bins(); }
+    [[nodiscard]] std::size_t q_bins() const { return order_parameter ? order_parameter->bins() : 1; }
+    [[nodiscard]] std::size_t cells() const;
+    [[nodiscard]] std::optional<std::size_t> index(double energy_value,
+                                                   double q_value = 0.0) const noexcept;
+    [[nodiscard]] std::size_t flatten(std::size_t energy_bin,
+                                      std::size_t q_bin = 0) const noexcept;
+    [[nodiscard]] std::size_t energy_bin(std::size_t cell) const noexcept;
+    [[nodiscard]] std::size_t q_bin(std::size_t cell) const noexcept;
+};
+
+struct WeightedOrderParameter {
+    std::vector<double> weights;
+    double normalization{};
+    OrderParameterGrid grid;
+
+    static WeightedOrderParameter create(std::vector<double> weights, double bin_width);
+    [[nodiscard]] double evaluate(std::span<const std::int8_t> spins) const;
+    [[nodiscard]] double flip_delta(std::size_t index, std::int8_t old_spin) const noexcept {
+        return -2.0 * weights[index] * static_cast<double>(old_spin);
+    }
+};
+
 struct EnergyWindow {
     std::size_t begin{};
     std::size_t end{}; // exclusive
@@ -53,6 +93,7 @@ struct WlParameters {
     bool collect_window_statistics{false};
     double round_trip_margin_fraction{0.1};
     bool nalivaiko_mod{false};
+    std::size_t support_stability_checks{10};
 };
 
 enum class RefinementStage : std::uint8_t { wang_landau, inverse_time, frozen };
@@ -76,6 +117,10 @@ struct WalkerSnapshot {
     std::vector<std::int8_t> spins;
     std::vector<double> fields;
     double energy{};
+    double order_parameter{};
+    bool joint_dos{false};
+    OrderParameterGrid order_grid{};
+    double order_normalization{};
     std::vector<double> log_g;
     std::vector<std::uint64_t> histogram;
     std::vector<std::uint8_t> active;
@@ -84,6 +129,7 @@ struct WalkerSnapshot {
     std::uint64_t accepted{};
     std::uint64_t forced_accepted{};
     std::uint64_t last_accepted_attempt{};
+    std::uint64_t last_new_cell_attempt{};
     RefinementStage stage{RefinementStage::wang_landau};
     std::array<std::uint64_t, 4> rng_state{};
 };
@@ -93,6 +139,11 @@ public:
     WangLandauWalker(std::uint64_t walker_id, std::shared_ptr<const Couplings> couplings,
                      EnergyGrid grid, EnergyWindow window, WlParameters parameters,
                      std::uint64_t master_seed,
+                     std::vector<std::int8_t> initial_spins = {});
+    WangLandauWalker(std::uint64_t walker_id, std::shared_ptr<const Couplings> couplings,
+                     DosGrid grid, EnergyWindow window, WlParameters parameters,
+                     std::uint64_t master_seed,
+                     std::shared_ptr<const WeightedOrderParameter> order_parameter,
                      std::vector<std::int8_t> initial_spins = {});
 
     bool attempt_flip();
@@ -108,6 +159,8 @@ public:
     void restore(const WalkerSnapshot& snapshot);
     [[nodiscard]] std::uint64_t id() const noexcept { return id_; }
     [[nodiscard]] double energy() const noexcept { return energy_; }
+    [[nodiscard]] double order_parameter() const noexcept { return order_parameter_value_; }
+    [[nodiscard]] const DosGrid& dos_grid() const noexcept { return dos_grid_; }
     [[nodiscard]] std::optional<std::size_t> energy_bin() const noexcept { return grid_.index(energy_); }
     [[nodiscard]] RefinementStage stage() const noexcept { return stage_; }
     [[nodiscard]] double factor() const noexcept { return factor_; }
@@ -133,7 +186,8 @@ public:
     }
 
     void replace_configuration(std::span<const std::int8_t> spins,
-                               std::span<const double> fields, double energy);
+                               std::span<const double> fields, double energy,
+                               double order_parameter = 0.0);
     void swap_configuration(WangLandauWalker& other);
     [[nodiscard]] double exchange_log_probability(const WangLandauWalker& other) const;
 
@@ -141,12 +195,15 @@ private:
     std::uint64_t id_{};
     std::shared_ptr<const Couplings> couplings_;
     EnergyGrid grid_;
+    DosGrid dos_grid_;
+    std::shared_ptr<const WeightedOrderParameter> order_parameter_;
     EnergyWindow window_;
     WlParameters parameters_;
     Xoshiro256StarStar rng_;
     std::vector<std::int8_t> spins_;
     std::vector<double> fields_;
     double energy_{};
+    double order_parameter_value_{};
     std::vector<double> log_g_;
     std::vector<std::uint64_t> histogram_;
     std::vector<std::uint8_t> active_;
@@ -160,6 +217,7 @@ private:
     std::uint64_t accepted_{};
     std::uint64_t forced_accepted_{};
     std::uint64_t last_accepted_attempt_{};
+    std::uint64_t last_new_cell_attempt_{};
     RefinementStage stage_{RefinementStage::wang_landau};
     std::uint8_t round_trip_state_{};
     std::uint64_t round_trips_{};
@@ -168,6 +226,7 @@ private:
     std::vector<EnergyRepresentative> representatives_;
 
     void update_current_bin();
+    [[nodiscard]] std::optional<std::size_t> current_cell() const noexcept;
     [[nodiscard]] std::size_t active_bins() const noexcept;
     void update_inverse_time_factor();
     void update_round_trip_state() noexcept;

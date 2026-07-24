@@ -112,6 +112,10 @@ void apply_ini_setting(RunConfig& c,const std::string& section,const std::string
     else if(full=="energy.emax"||full=="energy.maximum") {c.grid.maximum=number<double>(value,full);have_max=true;}
     else if(full=="energy.bin_width"||full=="energy.width") {c.grid.width=number<double>(value,full);have_width=true;}
     else if(full=="energy.complete_range") c.complete_range=boolean(value,full);
+    else if(full=="order_parameter.mode") c.order_parameter_mode=value;
+    else if(full=="order_parameter.bin_width") c.q_bin_width=number<double>(value,full);
+    else if(full=="order_parameter.support_stability_checks")
+        c.wl.support_stability_checks=number<std::size_t>(value,full);
     else if(full=="parallel.windows") c.windows=number<std::size_t>(value,full);
     else if(full=="parallel.walkers"||full=="parallel.walkers_per_rank") c.walkers_per_rank=number<std::size_t>(value,full);
     else if(full=="parallel.overlap") c.overlap=number<double>(value,full);
@@ -235,6 +239,25 @@ void RunConfig::resolve_mcs(std::size_t spin_count) {
     resolved_spin_count=spin_count;
 }
 
+void RunConfig::resolve_order_parameter(const Geometry& geometry) {
+    auto mode=order_parameter_mode;
+    std::transform(mode.begin(),mode.end(),mode.begin(),[](unsigned char ch){
+        return static_cast<char>(std::tolower(ch));
+    });
+    order_parameter_mode=mode;
+    if(mode=="none") { order_parameter.reset(); return; }
+    if(mode!="weighted_sum")
+        throw std::invalid_argument("order_parameter.mode must be none or weighted_sum");
+    if(geometry.order_weights.empty())
+        throw std::invalid_argument("weighted_sum requires a geometry CSV with q_weight");
+    order_parameter=std::make_shared<WeightedOrderParameter>(
+        WeightedOrderParameter::create(geometry.order_weights,q_bin_width));
+}
+
+DosGrid RunConfig::dos_grid() const {
+    return {grid,order_parameter?std::optional<OrderParameterGrid>(order_parameter->grid):std::nullopt};
+}
+
 bool RunConfig::uses_legacy_attempt_units() const noexcept {
     return !exchange_interval_uses_mcs || !check_interval_uses_mcs ||
            !force_accept_after_uses_mcs || !max_limit_uses_mcs || !checkpoint_interval_uses_mcs;
@@ -253,6 +276,12 @@ void RunConfig::validate(bool require_grid) const {
     if (require_grid && !energy_grid_explicit)
         throw std::invalid_argument("Production runs require --emin, --emax, and --bin-width");
     grid.validate();
+    if(order_parameter_mode!="none") {
+        if(order_parameter_mode!="weighted_sum"||!order_parameter||
+           !(q_bin_width>0.0)||!std::isfinite(q_bin_width)||wl.support_stability_checks==0)
+            throw std::invalid_argument("Invalid weighted order-parameter configuration");
+        dos_grid().validate();
+    }
     if (windows > grid.bins()) throw std::invalid_argument("More windows than energy bins");
     if(!explicit_windows.empty()) {
         if(explicit_windows.size()!=windows || explicit_windows.front().begin!=0 ||
@@ -315,6 +344,10 @@ RunConfig parse_arguments(int argc, char** argv) {
         else if (key == "--emin") { c.grid.minimum=number<double>(value(i,key),key); have_min=true; }
         else if (key == "--emax") { c.grid.maximum=number<double>(value(i,key),key); have_max=true; }
         else if (key == "--bin-width") { c.grid.width=number<double>(value(i,key),key); have_width=true; }
+        else if (key == "--order-parameter") c.order_parameter_mode=value(i,key);
+        else if (key == "--q-bin-width") c.q_bin_width=number<double>(value(i,key),key);
+        else if (key == "--support-stability-checks")
+            c.wl.support_stability_checks=number<std::size_t>(value(i,key),key);
         else if (key == "--windows") c.windows=number<std::size_t>(value(i,key),key);
         else if (key == "--walkers") c.walkers_per_rank=number<std::size_t>(value(i,key),key);
         else if (key == "--overlap") c.overlap=number<double>(value(i,key),key);
@@ -375,6 +408,8 @@ std::string usage(std::string_view program) {
     return "Usage: " + std::string(program) +
       " --emin E --emax E --bin-width dE [--nx N --ny N --nz N]\n"
       "  [--geometry file --box-x L --box-y L --box-z L] [--cutoff R]\n"
+      "  [--order-parameter none|weighted_sum --q-bin-width dQ]\n"
+      "  [--support-stability-checks N] (weighted_sum requires CSV q_weight)\n"
       "  [--config run.ini] (CLI options override INI values)\n"
       "  [--windows N --walkers N --overlap 0.75] [--seed N]\n"
       "  [--adaptive-windows true|false --adaptive-iterations N --adaptive-pilot-mcs MCS]\n"
@@ -407,6 +442,22 @@ void write_dos_csv(const std::string& path, const DensityOfStates& dos) {
             << static_cast<unsigned>(dos.valid[i]) << '\n';
 }
 
+void write_joint_dos_csv(const std::string& path,const JointDensityOfStates& dos) {
+    if(!dos.grid.joint()||dos.log_g.size()!=dos.grid.cells()||
+       dos.histogram.size()!=dos.log_g.size()||dos.standard_error.size()!=dos.log_g.size()||
+       dos.valid.size()!=dos.log_g.size())
+        throw std::invalid_argument("Invalid joint DOS output arrays");
+    std::ofstream out(path); if(!out) throw std::runtime_error("Cannot write "+path);
+    out<<"e_bin,q_bin,energy,Q,q,log_g,histogram,standard_error,valid\n"<<std::setprecision(17);
+    for(std::size_t e=0;e<dos.grid.energy_bins();++e)
+        for(std::size_t q=0;q<dos.grid.q_bins();++q) {
+            const auto cell=dos.grid.flatten(e,q); const auto Q=dos.grid.order_parameter->center(q);
+            out<<e<<','<<q<<','<<dos.grid.energy.center(e)<<','<<Q<<','<<Q/dos.normalization
+               <<','<<dos.log_g[cell]<<','<<dos.histogram[cell]<<','<<dos.standard_error[cell]
+               <<','<<static_cast<unsigned>(dos.valid[cell])<<'\n';
+        }
+}
+
 void write_fragment_csv(const std::string& path, EnergyGrid grid, const DosFragment& f,
                         std::size_t window_id) {
     if(f.histogram.size()!=f.log_g.size()||f.standard_error.size()!=f.log_g.size()||
@@ -420,11 +471,49 @@ void write_fragment_csv(const std::string& path, EnergyGrid grid, const DosFragm
             << static_cast<unsigned>(f.valid[i]) << '\n';
 }
 
+void write_joint_fragment_csv(const std::string& path,const DosFragment& f,
+                              double normalization,std::size_t window_id) {
+    if(!f.grid.joint()||!(normalization>0.0)||f.log_g.size()!=f.grid.cells())
+        throw std::invalid_argument("Invalid joint DOS fragment");
+    std::ofstream out(path); if(!out) throw std::runtime_error("Cannot write "+path);
+    out<<"window,e_bin,q_bin,energy,Q,q,log_g,histogram,standard_error,valid\n"
+       <<std::setprecision(17);
+    for(std::size_t e=f.window.begin;e<f.window.end;++e)
+        for(std::size_t q=0;q<f.grid.q_bins();++q) {
+            const auto cell=f.grid.flatten(e,q);
+            const auto Q=f.grid.order_parameter->center(q);
+            out<<window_id<<','<<e<<','<<q<<','<<f.grid.energy.center(e)<<','<<Q<<','
+               <<Q/normalization<<','<<f.log_g[cell]<<','<<f.histogram[cell]<<','
+               <<f.standard_error[cell]<<','<<static_cast<unsigned>(f.valid[cell])<<'\n';
+        }
+}
+
 void write_thermodynamics_csv(const std::string& path, std::span<const ThermodynamicPoint> p) {
     std::ofstream out(path); if (!out) throw std::runtime_error("Cannot write " + path);
     out << "temperature,log_Z,U,C,F,S\n" << std::setprecision(17);
     for (const auto& x:p) out << x.temperature<<','<<x.log_partition<<','<<x.internal_energy<<','
                               <<x.heat_capacity<<','<<x.free_energy<<','<<x.entropy<<'\n';
+}
+
+void write_order_parameter_thermodynamics_csv(
+    const std::string& path,std::span<const OrderParameterThermodynamicPoint> points) {
+    std::ofstream out(path); if(!out) throw std::runtime_error("Cannot write "+path);
+    out<<"temperature,mean_q,mean_abs_q,mean_q2,mean_q4,mean_Q,mean_abs_Q,mean_Q2,mean_Q4,susceptibility,binder_cumulant\n"
+       <<std::setprecision(17);
+    for(const auto& x:points)
+        out<<x.temperature<<','<<x.mean_q<<','<<x.mean_abs_q<<','<<x.mean_q2<<','<<x.mean_q4
+           <<','<<x.mean_Q<<','<<x.mean_abs_Q<<','<<x.mean_Q2<<','<<x.mean_Q4<<','
+           <<x.susceptibility<<','<<x.binder_cumulant<<'\n';
+}
+
+void write_order_parameter_distribution_csv(
+    const std::string& path,std::span<const OrderParameterDistributionPoint> points) {
+    std::ofstream out(path); if(!out) throw std::runtime_error("Cannot write "+path);
+    out<<"temperature,q_bin,Q,q,probability,log_probability,relative_free_energy\n"
+       <<std::setprecision(17);
+    for(const auto& x:points)
+        out<<x.temperature<<','<<x.q_bin<<','<<x.Q<<','<<x.q<<','<<x.probability<<','
+           <<x.log_probability<<','<<x.relative_free_energy<<'\n';
 }
 
 void write_workers_stat_csv(const std::string& path,
@@ -458,7 +547,7 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
                          bool converged, int mpi_size, int omp_threads) {
     std::ofstream out(path); if (!out) throw std::runtime_error("Cannot write " + path);
     out << std::setprecision(17)
-        << "{\n  \"format_version\": 4,\n  \"config_file\": \""<<json_escape(c.config_file)<<"\",\n"
+        << "{\n  \"format_version\": 5,\n  \"config_file\": \""<<json_escape(c.config_file)<<"\",\n"
         << "  \"geometry_file\": \""<<json_escape(c.geometry_file)<<"\",\n"
         << "  \"physics\": {\"model\": \"dipolar_ising\", "
         << "\"spins\": "<<couplings.size()<<", \"coupling_scale\": "<<c.coupling_scale<<", \"periodic\": "<<(c.periodic?"true":"false")
@@ -466,6 +555,22 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         << ", \"backend\": \""<<couplings.backend_name()<<"\", \"cutoff\": "<<c.cutoff<<"},\n"
         << "  \"energy_grid\": {\"minimum\": "<<c.grid.minimum<<", \"maximum\": "<<c.grid.maximum
         << ", \"bin_width\": "<<c.grid.width<<", \"complete_range\": "<<(c.complete_range?"true":"false")<<"},\n"
+        << "  \"order_parameter\": {\"mode\": \""<<c.order_parameter_mode<<"\""
+        << ", \"weight_source\": \""<<(c.order_parameter?"geometry_csv_q_weight":"none")<<"\""
+        << ", \"bin_width\": "<<c.q_bin_width
+        << ", \"support_stability_checks\": "<<c.wl.support_stability_checks;
+    if(c.order_parameter) out<<", \"normalization_W\": "<<c.order_parameter->normalization
+        <<", \"minimum\": "<<c.order_parameter->grid.minimum
+        <<", \"maximum\": "<<c.order_parameter->grid.maximum
+        <<", \"bins\": "<<c.order_parameter->grid.bins()
+        <<", \"cells\": "<<c.dos_grid().cells()
+        <<", \"definition\": \"Q=sum_i(w_i*sigma_i), q=Q/W\""
+        <<", \"susceptibility\": \"N*(<q^2>-<q>^2)/(k_B*T)\""
+        <<", \"binder\": \"1-<q^4>/(3*<q^2>^2)\""
+        <<", \"moment_coordinate\": \"Q_bin_center\""
+        <<", \"marginal_sem\": \"delta_method_without_cell_covariance\""
+        <<", \"invalid_cells\": \"unknown_not_structural_zero\"";
+    out<<"},\n"
         << "  \"algorithm\": {\"variant\": \""<<(c.wl.inverse_time_enabled?"REWL-1/t":"REWL")
         << "\", \"windows\": "<<c.windows
         << ", \"walkers_per_rank\": "<<c.walkers_per_rank<<", \"overlap\": "<<c.overlap
@@ -540,13 +645,17 @@ void save_checkpoint(const std::string& path, const WalkerSnapshot& s) {
     const auto temporary = path + ".tmp";
     std::ofstream out(temporary, std::ios::binary|std::ios::trunc);
     if (!out) throw std::runtime_error("Cannot write checkpoint " + temporary);
-    const std::array<char,8> magic{'W','L','C','H','K','P','3','\0'};
+    const std::array<char,8> magic{'W','L','C','H','K','P','4','\0'};
     out.write(magic.data(), magic.size()); write_value(out,s.walker_id);
     write_vector(out,s.spins); write_vector(out,s.fields); write_value(out,s.energy);
+    write_value(out,s.order_parameter); write_value(out,s.joint_dos);
+    write_value(out,s.order_grid.minimum); write_value(out,s.order_grid.maximum);
+    write_value(out,s.order_grid.width); write_value(out,s.order_normalization);
     write_vector(out,s.log_g); write_vector(out,s.histogram); write_vector(out,s.active);
     write_value(out,s.factor); write_value(out,s.attempted); write_value(out,s.accepted);
     write_value(out,s.forced_accepted);
     write_value(out,s.last_accepted_attempt);
+    write_value(out,s.last_new_cell_attempt);
     const auto stage=static_cast<std::uint8_t>(s.stage); write_value(out,stage);
     for(const auto word:s.rng_state) write_value(out,word);
     out.close(); if(!out) throw std::runtime_error("Failed writing checkpoint");
@@ -559,14 +668,22 @@ WalkerSnapshot load_checkpoint(const std::string& path) {
     std::ifstream in(path,std::ios::binary); if(!in) throw std::runtime_error("Cannot open checkpoint "+path);
     std::array<char,8> magic{}; in.read(magic.data(),magic.size());
     const auto version=std::string_view(magic.data(),7);
-    if(version!="WLCHKP1" && version!="WLCHKP2" && version!="WLCHKP3")
+    if(version!="WLCHKP1" && version!="WLCHKP2" && version!="WLCHKP3" &&
+       version!="WLCHKP4")
         throw std::runtime_error("Invalid checkpoint format");
     WalkerSnapshot s; read_value(in,s.walker_id); read_vector(in,s.spins); read_vector(in,s.fields);
-    read_value(in,s.energy); read_vector(in,s.log_g); read_vector(in,s.histogram); read_vector(in,s.active);
+    read_value(in,s.energy);
+    if(version=="WLCHKP4") {
+        read_value(in,s.order_parameter); read_value(in,s.joint_dos);
+        read_value(in,s.order_grid.minimum); read_value(in,s.order_grid.maximum);
+        read_value(in,s.order_grid.width); read_value(in,s.order_normalization);
+    }
+    read_vector(in,s.log_g); read_vector(in,s.histogram); read_vector(in,s.active);
     read_value(in,s.factor); read_value(in,s.attempted); read_value(in,s.accepted);
-    if(version=="WLCHKP3") read_value(in,s.forced_accepted);
-    if(version=="WLCHKP2" || version=="WLCHKP3") read_value(in,s.last_accepted_attempt);
+    if(version=="WLCHKP3"||version=="WLCHKP4") read_value(in,s.forced_accepted);
+    if(version=="WLCHKP2" || version=="WLCHKP3"||version=="WLCHKP4") read_value(in,s.last_accepted_attempt);
     else s.last_accepted_attempt=s.accepted==0?0:s.attempted;
+    if(version=="WLCHKP4") read_value(in,s.last_new_cell_attempt);
     std::uint8_t stage{}; read_value(in,stage); s.stage=static_cast<RefinementStage>(stage);
     for(auto& word:s.rng_state) read_value(in,word); return s;
 }

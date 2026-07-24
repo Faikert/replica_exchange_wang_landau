@@ -15,6 +15,7 @@ struct DosFragment {
     std::vector<std::uint64_t> histogram;
     std::vector<double> standard_error;
     std::vector<std::uint8_t> valid;
+    DosGrid grid;
 };
 
 struct WindowSamplingStatistics {
@@ -47,6 +48,29 @@ struct DensityOfStates {
     bool fully_normalized{false};
 };
 
+struct JointDensityOfStates {
+    DosGrid grid;
+    double normalization{};
+    std::vector<double> log_g;
+    std::vector<std::uint64_t> histogram;
+    std::vector<double> standard_error;
+    std::vector<std::uint8_t> valid;
+    bool fully_normalized{false};
+};
+
+struct OrderParameterThermodynamicPoint {
+    double temperature{};
+    double mean_q{},mean_abs_q{},mean_q2{},mean_q4{};
+    double mean_Q{},mean_abs_Q{},mean_Q2{},mean_Q4{};
+    double susceptibility{},binder_cumulant{};
+};
+
+struct OrderParameterDistributionPoint {
+    double temperature{};
+    std::size_t q_bin{};
+    double Q{},q{},probability{},log_probability{},relative_free_energy{};
+};
+
 struct ThermodynamicPoint {
     double temperature{};
     double log_partition{};
@@ -64,6 +88,19 @@ struct ThermodynamicPoint {
     double boltzmann_constant = 1.0);
 [[nodiscard]] DosFragment exact_enumeration(const Couplings& couplings, EnergyGrid grid,
                                             std::size_t max_spins = 26);
+[[nodiscard]] DosFragment exact_enumeration(const Couplings& couplings, DosGrid grid,
+    const WeightedOrderParameter& order_parameter, std::size_t max_spins = 26);
+[[nodiscard]] JointDensityOfStates stitch_joint_dos(
+    DosGrid grid, std::span<const DosFragment> fragments, bool complete_range,
+    bool converged, std::size_t spin_count, double normalization);
+[[nodiscard]] DensityOfStates marginalize(const JointDensityOfStates& joint);
+[[nodiscard]] DosFragment marginalize_fragment(const DosFragment& joint);
+[[nodiscard]] std::vector<OrderParameterThermodynamicPoint> order_parameter_thermodynamics(
+    const JointDensityOfStates& dos, std::span<const double> temperatures,
+    std::size_t spin_count, double boltzmann_constant = 1.0);
+[[nodiscard]] std::vector<OrderParameterDistributionPoint> order_parameter_distribution(
+    const JointDensityOfStates& dos, std::span<const double> temperatures,
+    double boltzmann_constant = 1.0);
 [[nodiscard]] std::vector<EnergyWindow> adapt_energy_windows(
     EnergyGrid grid, std::span<const DosFragment> fragments,
     std::span<const WindowSamplingStatistics> sampling, std::size_t window_count,

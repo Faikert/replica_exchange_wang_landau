@@ -35,6 +35,8 @@ void Geometry::validate() const {
     if (positions.empty()) throw std::invalid_argument("Geometry contains no sites");
     if (positions.size() != axes.size())
         throw std::invalid_argument("Geometry positions/axes size mismatch");
+    if (!order_weights.empty() && order_weights.size() != positions.size())
+        throw std::invalid_argument("Geometry order-parameter weight count mismatch");
     if (box.periodic) {
         const auto valid_length = [](double length) {
             return std::isfinite(length) && length >= 0.0;
@@ -52,6 +54,8 @@ void Geometry::validate() const {
         const auto length = norm(axes[i]);
         if (std::abs(length - 1.0) > 1e-10)
             throw std::invalid_argument("Ising axes must be normalized");
+        if (!order_weights.empty() && !std::isfinite(order_weights[i]))
+            throw std::invalid_argument("Order-parameter weights must be finite");
     }
 }
 
@@ -116,24 +120,33 @@ Geometry Geometry::load_csv(const std::string& path, Box box) {
     };
     Geometry result; result.box=box;
     std::string line; std::size_t line_number=0; bool header_read=false;
+    bool have_order_weights=false;
     while (std::getline(input,line)) {
         ++line_number; const auto clean=trim(line);
         if (clean.empty() || clean[0]=='#') continue;
         const auto fields=columns(clean);
         if (!header_read) {
             const std::array<std::string,6> expected{"x","y","z","mx","my","mz"};
-            if (fields.size()!=expected.size())
-                throw std::runtime_error("CSV geometry header must be x,y,z,mx,my,mz");
+            if (fields.size()!=expected.size() && fields.size()!=expected.size()+1)
+                throw std::runtime_error("CSV geometry header must be x,y,z,mx,my,mz[,q_weight]");
             for(std::size_t i=0;i<expected.size();++i) {
                 auto name=fields[i];
                 std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
-                if(name!=expected[i]) throw std::runtime_error("CSV geometry header must be x,y,z,mx,my,mz");
+                if(name!=expected[i]) throw std::runtime_error("CSV geometry header must be x,y,z,mx,my,mz[,q_weight]");
+            }
+            if(fields.size()==7) {
+                auto name=fields[6];
+                std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+                if(name!="q_weight")
+                    throw std::runtime_error("Seventh CSV geometry column must be q_weight");
+                have_order_weights=true;
             }
             header_read=true; continue;
         }
-        if(fields.size()!=6) throw std::runtime_error("CSV geometry line "+std::to_string(line_number)+" must have 6 columns");
-        std::array<double,6> value{};
-        for(std::size_t i=0;i<value.size();++i) {
+        const auto expected_fields=have_order_weights?7U:6U;
+        if(fields.size()!=expected_fields) throw std::runtime_error("CSV geometry line "+std::to_string(line_number)+" has the wrong column count");
+        std::array<double,7> value{};
+        for(std::size_t i=0;i<expected_fields;++i) {
             std::size_t used=0;
             try { value[i]=std::stod(fields[i],&used); }
             catch(const std::exception&) { throw std::runtime_error("Invalid number at CSV geometry line "+std::to_string(line_number)); }
@@ -142,6 +155,7 @@ Geometry Geometry::load_csv(const std::string& path, Box box) {
         }
         result.positions.push_back({value[0],value[1],value[2]});
         result.axes.push_back({value[3],value[4],value[5]});
+        if(have_order_weights) result.order_weights.push_back(value[6]);
     }
     if(!header_read) throw std::runtime_error("CSV geometry file has no header");
     result.validate();

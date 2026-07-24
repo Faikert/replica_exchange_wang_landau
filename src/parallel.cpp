@@ -24,9 +24,13 @@ DosFragment summarize_impl(EnergyWindow window,
                            std::span<const WangLandauWalker* const> walkers,std::size_t bins,
                            bool allow_empty_intersection) {
     const auto nan=std::numeric_limits<double>::quiet_NaN();
-    DosFragment f{window,std::vector<double>(bins,nan),std::vector<std::uint64_t>(bins,0),
-                  std::vector<double>(bins,nan),std::vector<std::uint8_t>(bins,0)};
-    for(std::size_t i=window.begin;i<window.end;++i) {
+    const auto layout=walkers.front()->dos_grid();
+    const auto cells=layout.cells();
+    DosFragment f{window,std::vector<double>(cells,nan),std::vector<std::uint64_t>(cells,0),
+                  std::vector<double>(cells,nan),std::vector<std::uint8_t>(cells,0)};
+    f.grid=layout;
+    const auto begin=layout.flatten(window.begin),end=layout.flatten(window.end);
+    for(std::size_t i=begin;i<end;++i) {
         bool valid=true;
         for(const auto& walker:walkers) {
             valid=valid&&walker->active_mask()[i]!=0;
@@ -34,14 +38,14 @@ DosFragment summarize_impl(EnergyWindow window,
         }
         f.valid[i]=valid?1:0;
     }
-    const auto reference=std::find(f.valid.begin()+static_cast<std::ptrdiff_t>(window.begin),
-                                   f.valid.begin()+static_cast<std::ptrdiff_t>(window.end),1);
-    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(window.end) && allow_empty_intersection)
+    const auto reference=std::find(f.valid.begin()+static_cast<std::ptrdiff_t>(begin),
+                                   f.valid.begin()+static_cast<std::ptrdiff_t>(end),1);
+    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(end) && allow_empty_intersection)
         return f;
-    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(window.end))
+    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(end))
         throw std::runtime_error("Walkers in an energy window have no common active bin");
     const auto reference_bin=static_cast<std::size_t>(reference-f.valid.begin());
-    for(std::size_t i=window.begin;i<window.end;++i) {
+    for(std::size_t i=begin;i<end;++i) {
         if(f.valid[i]==0) continue;
         f.log_g[i]=0.0;
         for(const auto& walker:walkers)
@@ -78,56 +82,68 @@ WindowSamplingStatistics summarize_sampling_impl(
 }
 
 #ifdef WL_HAS_MPI
+template<class T>
+void allreduce_chunks(const T* input,T* output,std::size_t count,MPI_Datatype type,
+                      MPI_Op operation,MPI_Comm communicator) {
+    constexpr auto maximum=static_cast<std::size_t>(std::numeric_limits<int>::max());
+    for(std::size_t offset=0;offset<count;) {
+        const auto chunk=std::min(maximum,count-offset);
+        MPI_Allreduce(input+offset,output+offset,static_cast<int>(chunk),type,operation,communicator);
+        offset+=chunk;
+    }
+}
+
 DosFragment summarize_distributed(EnergyWindow window,
                                   std::span<const std::unique_ptr<WangLandauWalker>> walkers,
                                   std::size_t bins,MPI_Comm communicator,
                                   bool allow_empty_intersection) {
     const auto nan=std::numeric_limits<double>::quiet_NaN();
-    DosFragment f{window,std::vector<double>(bins,nan),std::vector<std::uint64_t>(bins,0),
-                  std::vector<double>(bins,nan),std::vector<std::uint8_t>(bins,0)};
-    std::vector<std::uint64_t> local_histogram(bins,0),global_histogram(bins,0);
-    std::vector<std::uint8_t> local_valid(bins,0),global_valid(bins,0);
-    for(std::size_t i=window.begin;i<window.end;++i) {
+    const auto layout=walkers.front()->dos_grid();
+    const auto cells=layout.cells();
+    DosFragment f{window,std::vector<double>(cells,nan),std::vector<std::uint64_t>(cells,0),
+                  std::vector<double>(cells,nan),std::vector<std::uint8_t>(cells,0)};
+    f.grid=layout;
+    std::vector<std::uint64_t> local_histogram(cells,0),global_histogram(cells,0);
+    std::vector<std::uint8_t> local_valid(cells,0),global_valid(cells,0);
+    const auto begin=layout.flatten(window.begin),end=layout.flatten(window.end);
+    for(std::size_t i=begin;i<end;++i) {
         local_valid[i]=1;
         for(const auto& walker:walkers) {
             local_valid[i]=static_cast<std::uint8_t>(local_valid[i]&&walker->active_mask()[i]!=0);
             local_histogram[i]+=walker->histogram()[i];
         }
     }
-    MPI_Allreduce(local_valid.data(),global_valid.data(),static_cast<int>(bins),MPI_UNSIGNED_CHAR,
-                  MPI_MIN,communicator);
-    MPI_Allreduce(local_histogram.data(),global_histogram.data(),static_cast<int>(bins),
-                  MPI_UINT64_T,MPI_SUM,communicator);
+    allreduce_chunks(local_valid.data(),global_valid.data(),cells,MPI_UNSIGNED_CHAR,MPI_MIN,communicator);
+    allreduce_chunks(local_histogram.data(),global_histogram.data(),cells,MPI_UINT64_T,MPI_SUM,communicator);
     f.valid=std::move(global_valid);
     f.histogram=std::move(global_histogram);
-    const auto reference=std::find(f.valid.begin()+static_cast<std::ptrdiff_t>(window.begin),
-                                   f.valid.begin()+static_cast<std::ptrdiff_t>(window.end),1);
-    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(window.end) && allow_empty_intersection)
+    const auto reference=std::find(f.valid.begin()+static_cast<std::ptrdiff_t>(begin),
+                                   f.valid.begin()+static_cast<std::ptrdiff_t>(end),1);
+    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(end) && allow_empty_intersection)
         return f;
-    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(window.end))
+    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(end))
         throw std::runtime_error("Walkers in an MPI energy window have no common active bin");
     const auto reference_bin=static_cast<std::size_t>(reference-f.valid.begin());
     std::uint64_t local_count=static_cast<std::uint64_t>(walkers.size()),walker_count=0;
     MPI_Allreduce(&local_count,&walker_count,1,MPI_UINT64_T,MPI_SUM,communicator);
-    std::vector<double> local_sum(bins,0.0),global_sum(bins,0.0);
+    std::vector<double> local_sum(cells,0.0),global_sum(cells,0.0);
     for(const auto& walker:walkers)
-        for(std::size_t i=window.begin;i<window.end;++i)
+        for(std::size_t i=begin;i<end;++i)
             if(f.valid[i]!=0) local_sum[i]+=walker->log_g()[i]-walker->log_g()[reference_bin];
-    MPI_Allreduce(local_sum.data(),global_sum.data(),static_cast<int>(bins),MPI_DOUBLE,MPI_SUM,
-                  communicator);
-    for(std::size_t i=window.begin;i<window.end;++i)
+    allreduce_chunks(local_sum.data(),global_sum.data(),cells,MPI_DOUBLE,MPI_SUM,communicator);
+    for(std::size_t i=begin;i<end;++i)
         if(f.valid[i]!=0) f.log_g[i]=global_sum[i]/static_cast<double>(walker_count);
     if(walker_count>1) {
-        std::vector<double> local_squared_deviation(bins,0.0),global_squared_deviation(bins,0.0);
+        std::vector<double> local_squared_deviation(cells,0.0),global_squared_deviation(cells,0.0);
         for(const auto& walker:walkers)
-            for(std::size_t i=window.begin;i<window.end;++i) if(f.valid[i]!=0) {
+            for(std::size_t i=begin;i<end;++i) if(f.valid[i]!=0) {
                 const auto value=walker->log_g()[i]-walker->log_g()[reference_bin];
                 const auto delta=value-f.log_g[i];
                 local_squared_deviation[i]+=delta*delta;
             }
-        MPI_Allreduce(local_squared_deviation.data(),global_squared_deviation.data(),
-                      static_cast<int>(bins),MPI_DOUBLE,MPI_SUM,communicator);
-        for(std::size_t i=window.begin;i<window.end;++i)
+        allreduce_chunks(local_squared_deviation.data(),global_squared_deviation.data(),cells,
+                         MPI_DOUBLE,MPI_SUM,communicator);
+        for(std::size_t i=begin;i<end;++i)
             if(f.valid[i]!=0) f.standard_error[i]=std::sqrt(global_squared_deviation[i]/
                 (static_cast<double>(walker_count)*static_cast<double>(walker_count-1)));
     }
@@ -171,9 +187,13 @@ DosFragment summarize_walkers(EnergyWindow window,
                               std::span<const WangLandauWalker* const> walkers,
                               std::size_t bins,bool allow_empty_intersection) {
     if(walkers.empty()) throw std::invalid_argument("No walkers to summarize");
+    if(!walkers.front()) throw std::invalid_argument("Cannot summarize a null walker");
+    const auto layout=walkers.front()->dos_grid();
     for(const auto* walker:walkers)
-        if(!walker||walker->log_g().size()!=bins||walker->window().begin!=window.begin||
-           walker->window().end!=window.end)
+        if(!walker||walker->dos_grid().energy_bins()!=bins||
+           walker->log_g().size()!=walker->dos_grid().cells()||walker->window().begin!=window.begin||
+           walker->window().end!=window.end||walker->dos_grid().joint()!=layout.joint()||
+           walker->dos_grid().q_bins()!=layout.q_bins())
             throw std::invalid_argument("Cannot summarize incompatible walkers");
     return summarize_impl(window,walkers,bins,allow_empty_intersection);
 }
@@ -316,7 +336,8 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 if(!c.initial_spins_by_walker.empty())
                     initial_spins=c.initial_spins_by_walker[static_cast<std::size_t>(global_id)];
                 group.push_back(std::make_unique<WangLandauWalker>(
-                    global_id,couplings,c.grid,windows[w],c.wl,c.seed,std::move(initial_spins)));
+                    global_id,couplings,c.dos_grid(),windows[w],c.wl,c.seed,
+                    c.order_parameter,std::move(initial_spins)));
             }
         }
     }
@@ -427,13 +448,19 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
             if(partner>=0) {
                 const auto slot=static_cast<std::size_t>(epoch%c.walkers_per_rank);
                 auto& walker=*groups[window_id][slot]; auto own=walker.snapshot();
-                double other_energy{};
-                MPI_Sendrecv(&own.energy,1,MPI_DOUBLE,partner,10,&other_energy,1,MPI_DOUBLE,partner,10,
+                double own_state[2]{own.energy,own.order_parameter},other_state[2]{};
+                MPI_Sendrecv(own_state,2,MPI_DOUBLE,partner,10,other_state,2,MPI_DOUBLE,partner,10,
                              MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+                const auto other_energy=other_state[0];
+                const auto other_order_parameter=other_state[1];
                 const auto own_bin=c.grid.index(own.energy),other_bin=c.grid.index(other_energy);
                 double contribution=-std::numeric_limits<double>::infinity();
-                if(own_bin&&other_bin&&windows[window_id].contains(*own_bin)&&windows[window_id].contains(*other_bin))
-                    contribution=own.log_g[*own_bin]-own.log_g[*other_bin];
+                const auto layout=c.dos_grid();
+                const auto own_cell=layout.index(own.energy,own.order_parameter);
+                const auto other_cell=layout.index(other_energy,other_order_parameter);
+                if(own_bin&&other_bin&&own_cell&&other_cell&&windows[window_id].contains(*own_bin)&&
+                   windows[window_id].contains(*other_bin))
+                    contribution=own.log_g[*own_cell]-own.log_g[*other_cell];
                 double other_contribution{};
                 MPI_Sendrecv(&contribution,1,MPI_DOUBLE,partner,11,&other_contribution,1,MPI_DOUBLE,partner,11,
                              MPI_COMM_WORLD,MPI_STATUS_IGNORE);
@@ -452,7 +479,8 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                     MPI_Sendrecv(own.fields.data(),static_cast<int>(own.fields.size()),MPI_DOUBLE,partner,13,
                                  remote_fields.data(),static_cast<int>(remote_fields.size()),MPI_DOUBLE,partner,13,
                                  MPI_COMM_WORLD,MPI_STATUS_IGNORE);
-                    walker.replace_configuration(remote_spins,remote_fields,other_energy);
+                    walker.replace_configuration(remote_spins,remote_fields,other_energy,
+                                                 other_order_parameter);
                     ++result.exchange_accepted;
                 }
             }

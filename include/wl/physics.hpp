@@ -23,6 +23,7 @@ struct Box {
 struct Geometry {
     std::vector<Vec3> positions;
     std::vector<Vec3> axes;
+    std::vector<double> order_weights;
     Box box;
 
     [[nodiscard]] std::size_t size() const noexcept { return positions.size(); }

@@ -42,6 +42,25 @@ If `seed` is omitted from both the INI file and the command line, MPI rank 0 gen
 
 See `examples/system.csv` and `examples/run.ini` for the supported sections and keys.
 
+### Joint density of states g(E,Q)
+
+Set `[order_parameter] mode = weighted_sum` to sample the signed joint DOS for
+`Q = sum_i q_weight_i*sigma_i`. The geometry CSV must then contain the seventh column
+`q_weight`. Its `bin_width` defines the coarse-grained Q resolution; the symmetric range is
+constructed automatically from `W = sum_i |q_weight_i|`, and output also contains `q=Q/W`.
+Energy windows still partition only E. A newly discovered `(E,Q)` cell delays the next WL
+iteration for `support_stability_checks` histogram-check intervals (default 10).
+
+```powershell
+build/Release/wl_run.exe --config examples/run_2d.ini
+build/Release/wl_exact.exe --config examples/run_2d.ini --output exact_2d
+```
+
+The 2D run writes `_dos2d.csv`, the marginal `_dos.csv`, `_q_thermo.csv`,
+`_q_distribution.csv`, and per-window `_window_N_dos2d.csv` files. The Q thermodynamics
+include signed and absolute moments, `chi_q=N(<q^2>-<q>^2)/(k_B T)`, and the Binder
+cumulant `U4=1-<q^4>/(3<q^2>^2)`. Moments use Q-bin centers.
+
 User-facing work intervals are expressed in Monte Carlo sweeps (MCS): one MCS is `N` attempted single-spin flips per walker, with spins selected randomly with replacement. Fractional MCS values are allowed and resolve to the nearest positive integer number of flip attempts. The preferred keys are `exchange_interval_mcs`, `check_interval_mcs`, `force_accept_after_mcs`, `max_mcs`, and `checkpoint_interval_mcs`. Legacy attempt-based keys remain accepted with a warning and retain their old meaning.
 
 Exact attempted-flip counts are still stored because histogram updates, checkpoint restart, and the internal `1/t` refinement use one update per proposal. Metadata and runtime output contain both MCS and resolved flip-attempt counts.
@@ -106,4 +125,4 @@ Stitch previously generated fragment CSV files with `wl_analyze`. Measure increm
 - Adjacent windows overlap by 75% by default. DOS fragments are joined where their local linear estimates of `d log(g)/dE` agree best.
 - A run that reaches `--max-mcs` before `--final-factor` is marked `converged=false`; it is never silently presented as converged.
 
-CUDA/HIP, Ewald summation, continuous kernel DOS, and joint `g(E,M)` are intentionally outside this first CPU implementation.
+CUDA/HIP, Ewald summation, and continuous-kernel DOS are not implemented.

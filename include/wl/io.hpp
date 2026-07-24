@@ -3,6 +3,7 @@
 #include "wl/analysis.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -21,6 +22,9 @@ struct RunConfig {
     double cutoff{0.0};
     EnergyGrid grid{-20.0, 20.0, 0.1};
     bool energy_grid_explicit{false};
+    std::string order_parameter_mode{"none"};
+    double q_bin_width{};
+    std::shared_ptr<const WeightedOrderParameter> order_parameter;
     std::size_t windows{1};
     std::size_t walkers_per_rank{1};
     double overlap{0.75};
@@ -53,6 +57,8 @@ struct RunConfig {
     double progress_interval_seconds{};
 
     void resolve_mcs(std::size_t spin_count);
+    void resolve_order_parameter(const Geometry& geometry);
+    [[nodiscard]] DosGrid dos_grid() const;
     [[nodiscard]] bool uses_legacy_attempt_units() const noexcept;
     void validate(bool require_explicit_grid = true) const;
 };
@@ -77,10 +83,17 @@ struct WalkerStatistics {
 [[nodiscard]] RunConfig parse_arguments(int argc, char** argv);
 [[nodiscard]] std::string usage(std::string_view program);
 void write_dos_csv(const std::string& path, const DensityOfStates& dos);
+void write_joint_dos_csv(const std::string& path, const JointDensityOfStates& dos);
 void write_fragment_csv(const std::string& path, EnergyGrid grid, const DosFragment& fragment,
                         std::size_t window_id);
+void write_joint_fragment_csv(const std::string& path,const DosFragment& fragment,
+                              double normalization,std::size_t window_id);
 void write_thermodynamics_csv(const std::string& path,
                               std::span<const ThermodynamicPoint> points);
+void write_order_parameter_thermodynamics_csv(
+    const std::string& path,std::span<const OrderParameterThermodynamicPoint> points);
+void write_order_parameter_distribution_csv(
+    const std::string& path,std::span<const OrderParameterDistributionPoint> points);
 void write_workers_stat_csv(const std::string& path,
                             std::span<const WalkerStatistics> statistics, std::size_t spin_count);
 void write_metadata_json(const std::string& path, const RunConfig& config,
