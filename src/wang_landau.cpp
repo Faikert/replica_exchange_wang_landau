@@ -179,16 +179,19 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
                                    std::shared_ptr<const Couplings> couplings,
                                    EnergyGrid grid, EnergyWindow window,
                                    WlParameters parameters, std::uint64_t master_seed,
-                                   std::vector<std::int8_t> initial_spins)
+                                   std::vector<std::int8_t> initial_spins,
+                                   std::vector<std::int8_t> return_spins)
     : WangLandauWalker(walker_id,std::move(couplings),DosGrid{grid,std::nullopt},window,
-                       parameters,master_seed,nullptr,std::move(initial_spins)) {}
+                       parameters,master_seed,nullptr,std::move(initial_spins),
+                       std::move(return_spins)) {}
 
 WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
                                    std::shared_ptr<const Couplings> couplings,
                                    DosGrid dos_grid, EnergyWindow window,
                                    WlParameters parameters, std::uint64_t master_seed,
                                    std::shared_ptr<const WeightedOrderParameter> order_parameter,
-                                   std::vector<std::int8_t> initial_spins)
+                                   std::vector<std::int8_t> initial_spins,
+                                   std::vector<std::int8_t> return_spins)
     : id_(walker_id), couplings_(std::move(couplings)), grid_(dos_grid.energy),
       dos_grid_(std::move(dos_grid)), order_parameter_(std::move(order_parameter)),
       window_(window), parameters_(parameters), rng_(master_seed, walker_id) {
@@ -235,10 +238,25 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
         throw std::invalid_argument("Initial spin count mismatch");
     for (const auto spin : initial_spins)
         if (spin != -1 && spin != 1) throw std::invalid_argument("Spins must be +/-1");
+    if(parameters_.return_mode) {
+        if(return_spins.empty()) return_spins=initial_spins;
+        if(return_spins.size()!=couplings_->size())
+            throw std::invalid_argument("Return-state spin count mismatch");
+        for(const auto spin:return_spins)
+            if(spin!=-1&&spin!=1)
+                throw std::invalid_argument("Return-state spins must be +/-1");
+    }
     spins_ = std::move(initial_spins);
     fields_ = local_fields(*couplings_, spins_);
     energy_ = energy_from_fields(spins_,fields_);
     if(order_parameter_) order_parameter_value_=order_parameter_->evaluate(spins_);
+    if(parameters_.return_mode) {
+        return_spins_=std::move(return_spins);
+        return_fields_=local_fields(*couplings_,return_spins_);
+        return_energy_=energy_from_fields(return_spins_,return_fields_);
+        if(order_parameter_)
+            return_order_parameter_=order_parameter_->evaluate(return_spins_);
+    }
     log_g_.assign(dos_grid_.cells(), 0.0);
     histogram_.assign(dos_grid_.cells(), 0);
     active_.assign(dos_grid_.cells(), 0);
@@ -257,6 +275,11 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
                                           std::numeric_limits<double>::infinity());
         representatives_.resize(representative_count);
     }
+
+    initialize_in_window(supplied_initial_configuration);
+}
+
+void WangLandauWalker::initialize_in_window(bool supplied_initial_configuration) {
 
     // An explicitly supplied in-window configuration is authoritative. Otherwise sample
     // pi(E) proportional to exp(-abs(E-E_target)/T_search). Raise T_search after stalls
@@ -598,6 +621,19 @@ void WangLandauWalker::begin_next_iteration() {
         }
     }
     freeze_if_finished();
+    if(parameters_.return_mode) return_to_reference_configuration();
+}
+
+void WangLandauWalker::return_to_reference_configuration() {
+    if(return_spins_.size()!=spins_.size()||return_fields_.size()!=fields_.size())
+        throw std::logic_error("Return mode has no compatible reference configuration");
+    spins_=return_spins_;
+    fields_=return_fields_;
+    energy_=return_energy_;
+    order_parameter_value_=return_order_parameter_;
+    current_location_valid_=false;
+    round_trip_state_=0;
+    initialize_in_window(true);
 }
 
 void WangLandauWalker::freeze_if_finished() {

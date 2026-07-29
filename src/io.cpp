@@ -136,6 +136,7 @@ void apply_ini_setting(RunConfig& c,const std::string& section,const std::string
     else if(full=="wl.final_factor") c.wl.final_factor=number<double>(value,full);
     else if(full=="wl.inverse_time") c.wl.inverse_time_enabled=boolean(value,full);
     else if(full=="wl.nalivaiko_mod") c.wl.nalivaiko_mod=boolean(value,full);
+    else if(full=="wl.return_mode") c.wl.return_mode=boolean(value,full);
     else if(full=="wl.check_interval") { c.wl.check_interval_attempts=number<std::uint64_t>(value,full); c.check_interval_uses_mcs=false; }
     else if(full=="wl.check_interval_mcs") { c.check_interval_mcs=number<double>(value,full); c.check_interval_uses_mcs=true; }
     else if(full=="wl.force_accept_after") { c.wl.force_accept_after_attempts=number<std::uint64_t>(value,full); c.force_accept_after_uses_mcs=false; }
@@ -370,6 +371,7 @@ RunConfig parse_arguments(int argc, char** argv) {
         else if (key == "--final-factor") c.wl.final_factor=number<double>(value(i,key),key);
         else if (key == "--check-interval") { c.wl.check_interval_attempts=number<std::uint64_t>(value(i,key),key); c.check_interval_uses_mcs=false; }
         else if (key == "--inverse-time") c.wl.inverse_time_enabled=boolean(value(i,key),key);
+        else if (key == "--return-mode") c.wl.return_mode=boolean(value(i,key),key);
         else if (key == "--check-interval-mcs") { c.check_interval_mcs=number<double>(value(i,key),key); c.check_interval_uses_mcs=true; }
         else if (key == "--force-accept-after") { c.wl.force_accept_after_attempts=number<std::uint64_t>(value(i,key),key); c.force_accept_after_uses_mcs=false; }
         else if (key == "--force-accept-after-mcs") { c.force_accept_after_mcs=number<double>(value(i,key),key); c.force_accept_after_uses_mcs=true; }
@@ -420,6 +422,7 @@ std::string usage(std::string_view program) {
       "  [--adaptive-diffusivity-floor F --adaptive-curvature-weight W]\n"
       "  [--adaptive-round-trip-target R --adaptive-round-trip-penalty P]\n"
       "  [--flatness 0.8 --min-visits 100 --final-factor 1e-8 --inverse-time true|false]\n"
+      "  [--return-mode true|false] resets to the reference state after factor halving.\n"
       "  [--initialization-max-attempts N --initialization-target-fraction 0.5]\n"
       "  [--initialization-temperature-fraction 0.05]\n"
       "  [--initialization-stall-attempts-per-spin 1000]\n"
@@ -601,6 +604,9 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
             (c.wl.nalivaiko_mod?"histogram_flatness_over_current_iteration_bins":
                                 "histogram_flatness"))<<"\""
         << ", \"nalivaiko_mod\": "<<(c.wl.nalivaiko_mod?"true":"false")
+        << ", \"return_mode\": "<<(c.wl.return_mode?"true":"false")
+        << ", \"return_reference\": \"lowest_energy_supplied_warm_start_or_all_spins_plus_one\""
+        << ", \"return_search_updates_production_attempts\": false"
         << ", \"refinement_active_scope\": \""
         <<(c.wl.nalivaiko_mod?"current_iteration":"cumulative_discovered_bins")<<"\""
         << ", \"inverse_time_clock\": \"walker_local_attempted_flips/active_bins\""

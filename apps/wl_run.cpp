@@ -64,6 +64,7 @@ int main(int argc,char** argv) {
                      <<" checkpoint_interval_mcs="<<config.checkpoint_interval_mcs
                      <<" force_accept_after_mcs="<<config.force_accept_after_mcs
                      <<" inverse_time="<<(config.wl.inverse_time_enabled?"yes":"no")
+                     <<" return_mode="<<(config.wl.return_mode?"yes":"no")
                      <<" initialization_max_attempts="<<config.wl.initialization_max_attempts
                      <<" initialization_target_fraction="<<config.wl.initialization_target_fraction
                      <<" initialization_temperature_fraction="

@@ -94,6 +94,7 @@ struct WlParameters {
     double round_trip_margin_fraction{0.1};
     bool nalivaiko_mod{false};
     std::size_t support_stability_checks{10};
+    bool return_mode{false};
 };
 
 enum class RefinementStage : std::uint8_t { wang_landau, inverse_time, frozen };
@@ -143,12 +144,14 @@ public:
     WangLandauWalker(std::uint64_t walker_id, std::shared_ptr<const Couplings> couplings,
                      EnergyGrid grid, EnergyWindow window, WlParameters parameters,
                      std::uint64_t master_seed,
-                     std::vector<std::int8_t> initial_spins = {});
+                     std::vector<std::int8_t> initial_spins = {},
+                     std::vector<std::int8_t> return_spins = {});
     WangLandauWalker(std::uint64_t walker_id, std::shared_ptr<const Couplings> couplings,
                      DosGrid grid, EnergyWindow window, WlParameters parameters,
                      std::uint64_t master_seed,
                      std::shared_ptr<const WeightedOrderParameter> order_parameter,
-                     std::vector<std::int8_t> initial_spins = {});
+                     std::vector<std::int8_t> initial_spins = {},
+                     std::vector<std::int8_t> return_spins = {});
 
     bool attempt_flip();
     void run_attempts(std::uint64_t count);
@@ -215,6 +218,10 @@ private:
     std::vector<double> fields_;
     double energy_{};
     double order_parameter_value_{};
+    std::vector<std::int8_t> return_spins_;
+    std::vector<double> return_fields_;
+    double return_energy_{};
+    double return_order_parameter_{};
     std::vector<double> log_g_;
     std::vector<std::uint64_t> histogram_;
     std::vector<std::uint8_t> active_;
@@ -261,6 +268,8 @@ private:
     void update_inverse_time_factor();
     void update_round_trip_state() noexcept;
     void update_representatives();
+    void initialize_in_window(bool supplied_initial_configuration);
+    void return_to_reference_configuration();
 };
 
 } // namespace wl

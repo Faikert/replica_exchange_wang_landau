@@ -570,6 +570,18 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
             if(!spins.empty()&&spins.size()!=couplings->size())
                 throw std::invalid_argument("Adaptive initial spin count mismatch");
     }
+    std::vector<std::int8_t> return_spins;
+    if(c.wl.return_mode&&!c.initial_spins_by_walker.empty()) {
+        double minimum_energy=std::numeric_limits<double>::infinity();
+        for(const auto& candidate:c.initial_spins_by_walker) {
+            if(candidate.empty()) continue;
+            const auto candidate_energy=total_energy(*couplings,candidate);
+            if(candidate_energy<minimum_energy) {
+                minimum_energy=candidate_energy;
+                return_spins=candidate;
+            }
+        }
+    }
     const auto window_id=distributed?static_cast<std::size_t>(context.rank())/shards:0;
     const auto first_window=distributed?window_id:0;
     const auto last_window=distributed?window_id+1:c.windows;
@@ -604,7 +616,7 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                     initial_spins=c.initial_spins_by_walker[static_cast<std::size_t>(global_id)];
                 group.push_back(std::make_unique<WangLandauWalker>(
                     global_id,couplings,c.dos_grid(),windows[w],c.wl,c.seed,
-                    c.order_parameter,std::move(initial_spins)));
+                    c.order_parameter,std::move(initial_spins),return_spins));
             }
         }
     }
@@ -673,6 +685,7 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
     bool globally_done=false;
     while(!globally_done) {
         bool limit_reached=!unlimited_attempts;
+        std::string return_error;
         for(std::size_t w=first_window;w<last_window;++w) {
             auto& group=groups[w];
             #pragma omp parallel for schedule(static)
@@ -701,9 +714,46 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 const auto histogram=walker.histogram_statistics();
                 last_flatness[w][local]=c.wl.inverse_time_enabled?
                     histogram.coverage:histogram.min_over_mean;
-                if(walker.ready_for_iteration()) walker.begin_next_iteration();
+                if(walker.ready_for_iteration()) {
+                    if(!c.wl.return_mode) {
+                        walker.begin_next_iteration();
+                    } else {
+                        try {
+                            walker.begin_next_iteration();
+                        } catch(const std::exception& error) {
+                            if(return_error.empty())
+                                return_error="window "+std::to_string(w)+", local walker "+
+                                    std::to_string(local)+": "+error.what();
+                        }
+                    }
+                }
             }
         }
+
+#ifdef WL_HAS_MPI
+        if(distributed&&c.wl.return_mode) {
+            const int local_failed=return_error.empty()?0:1;
+            int any_failed=0;
+            MPI_Allreduce(&local_failed,&any_failed,1,MPI_INT,MPI_MAX,MPI_COMM_WORLD);
+            if(any_failed!=0) {
+                const int local_failure_rank=local_failed!=0?context.rank():context.size();
+                int failure_rank=context.size();
+                MPI_Allreduce(&local_failure_rank,&failure_rank,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD);
+                int message_length=context.rank()==failure_rank?
+                    static_cast<int>(return_error.size()):0;
+                MPI_Bcast(&message_length,1,MPI_INT,failure_rank,MPI_COMM_WORLD);
+                std::string shared_error(static_cast<std::size_t>(message_length),'\0');
+                if(context.rank()==failure_rank) shared_error=return_error;
+                MPI_Bcast(shared_error.data(),message_length,MPI_CHAR,failure_rank,MPI_COMM_WORLD);
+                if(leader_comm!=MPI_COMM_NULL) MPI_Comm_free(&leader_comm);
+                if(window_comm!=MPI_COMM_NULL) MPI_Comm_free(&window_comm);
+                throw std::runtime_error("MPI return-mode initialization failed on rank "+
+                                         std::to_string(failure_rank)+": "+shared_error);
+            }
+        }
+#endif
+        if(c.wl.return_mode&&!return_error.empty())
+            throw std::runtime_error("Return-mode initialization failed: "+return_error);
 
         const auto parity=epoch%2;
         if(!distributed) {

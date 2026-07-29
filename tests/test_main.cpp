@@ -49,7 +49,7 @@ void test_csv_geometry_and_ini() {
         <<"minimum_width=1.25\ndiffusivity_floor_fraction=0.08\ncurvature_weight=0.4\n"
         <<"round_trip_target=3\nmaximum_round_trip_penalty=2.5\nround_trip_margin_fraction=0.15\n"
         <<"[wl]\ncheck_interval_mcs=2.5\nforce_accept_after_mcs=3.5\ninverse_time=false\n"
-        <<"nalivaiko_mod=true\n"
+        <<"nalivaiko_mod=true\nreturn_mode=true\n"
         <<"[initialization]\nmax_attempts=123\ntarget_fraction=0.4\ntemperature_fraction=0.07\n"
         <<"stall_attempts_per_spin=17\ntemperature_multiplier=3\nmax_temperature_fraction=0.4\n"
         <<"[run]\nseed=17\nmax_mcs=4.5\ncheckpoint_interval_mcs=5.5\nprogress=2\n"
@@ -73,6 +73,7 @@ void test_csv_geometry_and_ini() {
     near(config.progress_interval_seconds,2.0,1e-14,"INI progress interval");
     require(!config.wl.inverse_time_enabled,"INI inverse-time switch");
     require(config.wl.nalivaiko_mod,"INI Nalivaiko modification switch");
+    require(config.wl.return_mode,"INI return-mode switch");
     require(config.wl.initialization_max_attempts==123,"INI initialization attempts");
     near(config.wl.initialization_target_fraction,0.4,1e-14,"INI initialization target");
     near(config.wl.initialization_temperature_fraction,0.07,1e-14,
@@ -130,6 +131,7 @@ void test_csv_geometry_and_ini() {
                                std::istreambuf_iterator<char>());
     metadata_input.close();
     require(metadata.find("\"nalivaiko_mod\": true")!=std::string::npos&&
+            metadata.find("\"return_mode\": true")!=std::string::npos&&
             metadata.find("\"refinement_active_scope\": \"current_iteration\"")!=
                 std::string::npos,
             "Nalivaiko mode must be recorded in metadata");
@@ -351,6 +353,81 @@ void test_refinement_transition() {
         require(traditional.stage()!=wl::RefinementStage::inverse_time,"disabled inverse-time transition");
     }
     require(traditional.stage()==wl::RefinementStage::frozen,"traditional WL must stop at final factor");
+}
+
+void test_return_mode() {
+    const auto geometry=wl::Geometry::simple_cubic(2,1,1,1.0,{1,0,0},false);
+    auto couplings=std::make_shared<wl::DenseCouplings>(geometry,1.0);
+    const wl::EnergyGrid grid{-2.5,3.5,1.0};
+    wl::WlParameters parameters{0.1,1,0.1,1};
+    parameters.inverse_time_enabled=false;
+    parameters.return_mode=true;
+    parameters.initialization_max_attempts=100;
+    const std::vector<std::int8_t> reference{1,1};
+    const std::vector<std::int8_t> excited{1,-1};
+
+    wl::WangLandauWalker lowest(201,couplings,grid,{0,grid.bins()},parameters,17,
+                                excited,reference);
+    require(lowest.ready_for_iteration(),"return-mode test iteration must be ready");
+    const auto attempted_before=lowest.attempted();
+    lowest.begin_next_iteration();
+    require(std::equal(lowest.spins().begin(),lowest.spins().end(),reference.begin()),
+            "return mode must restore the reference configuration in the lowest window");
+    near(lowest.energy(),wl::total_energy(*couplings,reference),1e-14,
+         "return mode reference energy");
+    require(lowest.attempted()==attempted_before,
+            "return and initialization search must not increment production attempts");
+    require(std::accumulate(lowest.histogram().begin(),lowest.histogram().end(),
+                            std::uint64_t{0})==1,
+            "the returned initial state must seed the new WL histogram once");
+    near(lowest.factor(),0.5,1e-14,"return mode factor halving");
+
+    const auto excited_bin=grid.index(wl::total_energy(*couplings,excited));
+    require(excited_bin.has_value(),"excited state must lie on the test grid");
+    const wl::EnergyWindow upper{*excited_bin,*excited_bin+1};
+    wl::WangLandauWalker upper_walker(202,couplings,grid,upper,parameters,19,
+                                      excited,reference);
+    require(upper_walker.ready_for_iteration(),"upper return-mode iteration must be ready");
+    upper_walker.begin_next_iteration();
+    require(upper_walker.energy_bin()&&upper.contains(*upper_walker.energy_bin()),
+            "return mode must search from the reference state back into a higher window");
+    require(upper_walker.attempted()==0,
+            "higher-window return search must not increment production attempts");
+    const auto exact_fields=wl::local_fields(*couplings,upper_walker.spins());
+    require(std::equal(upper_walker.fields().begin(),upper_walker.fields().end(),
+                       exact_fields.begin()),"return-mode search must preserve local fields");
+    near(upper_walker.energy(),wl::energy_from_fields(upper_walker.spins(),exact_fields),
+         1e-14,"return-mode search must preserve energy");
+
+    auto disabled=parameters;
+    disabled.return_mode=false;
+    wl::WangLandauWalker ordinary(203,couplings,grid,{0,grid.bins()},disabled,17,excited,
+                                  reference);
+    ordinary.begin_next_iteration();
+    require(std::equal(ordinary.spins().begin(),ordinary.spins().end(),excited.begin()),
+            "disabled return mode must preserve the current configuration");
+
+    auto one_spin_couplings=std::make_shared<wl::DenseCouplings>(
+        wl::Geometry::simple_cubic(1,1,1,1.0,{0,0,1},false),1.0);
+    const auto order_value=wl::WeightedOrderParameter::create({2.0},1.0);
+    auto order=std::make_shared<const wl::WeightedOrderParameter>(order_value);
+    const wl::DosGrid joint_grid{{-1.0,1.0,0.5},order->grid};
+    const std::vector<std::int8_t> q_initial{-1};
+    const std::vector<std::int8_t> q_reference{1};
+    wl::WangLandauWalker joint(204,one_spin_couplings,joint_grid,
+        {0,joint_grid.energy_bins()},parameters,23,order,q_initial,q_reference);
+    auto joint_before=joint.snapshot();
+    joint_before.attempted=10;
+    joint_before.last_new_cell_attempt=0;
+    wl::WangLandauWalker joint_restored(204,one_spin_couplings,joint_grid,
+        {0,joint_grid.energy_bins()},parameters,23,order,q_initial,q_reference);
+    joint_restored.restore(joint_before);
+    joint_restored.begin_next_iteration();
+    near(joint_restored.order_parameter(),2.0,1e-14,
+         "joint return mode must restore the cached order parameter");
+    require(joint_restored.energy_bin().has_value()&&
+            joint_grid.index(joint_restored.energy(),joint_restored.order_parameter()).has_value(),
+            "joint return mode must refresh the cached DOS cell after checkpoint restore");
 }
 
 void test_unlimited_max_attempts() {
@@ -1145,6 +1222,7 @@ int main() {
       {"walker_checkpoint",test_walker_and_checkpoint},
       {"forced_acceptance",test_forced_acceptance},
       {"refinement_transition",test_refinement_transition},
+      {"return_mode",test_return_mode},
       {"histogram_statistics",test_histogram_statistics},
       {"nalivaiko_refinement_mask",test_nalivaiko_refinement_mask},
       {"classic_rewl_independence_summary",test_classic_rewl_independence_and_summary},
