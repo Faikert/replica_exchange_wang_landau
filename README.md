@@ -64,6 +64,9 @@ the number of contributing walkers and the connected support component. Walkers 
 by weighted least squares over their shared cells; cells visited by at least one aligned walker
 form the relaxed-union estimate. If the support graph is disconnected, window fragments,
 metadata, and walker diagnostics are still written, but a global DOS and thermodynamics are not.
+All DOS CSV files are sparse: bins with `valid=0` are omitted, while the original global bin
+indices are retained. Exact-enumeration structural zeros remain present because they are known
+parts of the support (`valid=1`, `log_g=-inf`), rather than unvisited sampling bins.
 
 User-facing work intervals are expressed in Monte Carlo sweeps (MCS): one MCS is `N` attempted single-spin flips per walker, with spins selected randomly with replacement. Fractional MCS values are allowed and resolve to the nearest positive integer number of flip attempts. The preferred keys are `exchange_interval_mcs`, `check_interval_mcs`, `force_accept_after_mcs`, `max_mcs`, and `checkpoint_interval_mcs`. Legacy attempt-based keys remain accepted with a warning and retain their old meaning.
 

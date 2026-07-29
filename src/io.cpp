@@ -439,10 +439,12 @@ void write_dos_csv(const std::string& path, const DensityOfStates& dos) {
         throw std::invalid_argument("DOS output arrays have different sizes");
     std::ofstream out(path); if (!out) throw std::runtime_error("Cannot write " + path);
     out << "bin,energy,log_g,histogram,standard_error,valid\n" << std::setprecision(17);
-    for (std::size_t i=0;i<dos.log_g.size();++i)
+    for (std::size_t i=0;i<dos.log_g.size();++i) {
+        if(dos.valid[i]==0) continue;
         out << i << ',' << dos.grid.center(i) << ',' << dos.log_g[i] << ','
             << dos.histogram[i] << ',' << dos.standard_error[i] << ','
             << static_cast<unsigned>(dos.valid[i]) << '\n';
+    }
 }
 
 void write_joint_dos_csv(const std::string& path,const JointDensityOfStates& dos) {
@@ -457,6 +459,7 @@ void write_joint_dos_csv(const std::string& path,const JointDensityOfStates& dos
     for(std::size_t e=0;e<dos.grid.energy_bins();++e)
         for(std::size_t q=0;q<dos.grid.q_bins();++q) {
             const auto cell=dos.grid.flatten(e,q); const auto Q=dos.grid.order_parameter->center(q);
+            if(dos.valid[cell]==0) continue;
             out<<e<<','<<q<<','<<dos.grid.energy.center(e)<<','<<Q<<','<<Q/dos.normalization
                <<','<<dos.log_g[cell]<<','<<dos.histogram[cell]<<','<<dos.standard_error[cell]
                <<','<<static_cast<unsigned>(dos.valid[cell])<<','<<dos.contributors[cell]<<','
@@ -471,10 +474,12 @@ void write_fragment_csv(const std::string& path, EnergyGrid grid, const DosFragm
         throw std::invalid_argument("DOS fragment output arrays have different sizes");
     std::ofstream out(path); if (!out) throw std::runtime_error("Cannot write " + path);
     out << "window,bin,energy,log_g,histogram,standard_error,valid\n" << std::setprecision(17);
-    for (auto i=f.window.begin;i<f.window.end;++i)
+    for (auto i=f.window.begin;i<f.window.end;++i) {
+        if(f.valid[i]==0) continue;
         out << window_id << ',' << i << ',' << grid.center(i) << ',' << f.log_g[i] << ','
             << f.histogram[i] << ',' << f.standard_error[i] << ','
             << static_cast<unsigned>(f.valid[i]) << '\n';
+    }
 }
 
 void write_joint_fragment_csv(const std::string& path,const DosFragment& f,
@@ -492,6 +497,7 @@ void write_joint_fragment_csv(const std::string& path,const DosFragment& f,
         for(std::size_t q=0;q<f.grid.q_bins();++q) {
             const auto cell=f.grid.flatten(e,q);
             const auto Q=f.grid.order_parameter->center(q);
+            if(f.valid[cell]==0) continue;
             out<<window_id<<','<<e<<','<<q<<','<<f.grid.energy.center(e)<<','<<Q<<','
                <<Q/normalization<<','<<f.log_g[cell]<<','<<f.histogram[cell]<<','
                <<f.standard_error[cell]<<','<<static_cast<unsigned>(f.valid[cell])<<','

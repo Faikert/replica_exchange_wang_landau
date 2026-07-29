@@ -165,6 +165,76 @@ void test_energy_grid_and_windows() {
     for(std::size_t i=1;i<windows.size();++i) require(windows[i].begin<windows[i-1].end,"window overlap");
 }
 
+void test_sparse_dos_csv_output() {
+    const auto directory=std::filesystem::temp_directory_path()/"wl_sparse_dos_csv_test";
+    std::filesystem::create_directories(directory);
+    const auto read_lines=[](const std::filesystem::path& path) {
+        std::ifstream input(path);
+        std::vector<std::string> lines;
+        for(std::string line;std::getline(input,line);) lines.push_back(std::move(line));
+        return lines;
+    };
+    const auto nan=std::numeric_limits<double>::quiet_NaN();
+    const wl::EnergyGrid energy_grid{-2.0,2.0,1.0};
+    const std::vector<double> log_g{nan,1.0,nan,-std::numeric_limits<double>::infinity()};
+    const std::vector<std::uint64_t> histogram{0,5,0,0};
+    const std::vector<double> standard_error{nan,0.25,nan,0.0};
+    const std::vector<std::uint8_t> valid{0,1,0,1};
+    const wl::DensityOfStates dos{energy_grid,log_g,histogram,standard_error,valid,{},false};
+    const auto dos_path=directory/"dos.csv";
+    wl::write_dos_csv(dos_path.string(),dos);
+    auto lines=read_lines(dos_path);
+    require(lines.size()==3&&lines[1].starts_with("1,")&&lines[2].starts_with("3,"),
+            "DOS CSV must omit invalid bins without renumbering valid bins");
+    require(lines[2].find(",-inf,0,0,1")!=std::string::npos,
+            "known structural-zero DOS bins must remain in output");
+
+    const wl::DosFragment fragment{{0,energy_grid.bins()},log_g,histogram,standard_error,
+                                   valid,wl::DosGrid{energy_grid,std::nullopt},{},{}};
+    const auto fragment_path=directory/"window.csv";
+    wl::write_fragment_csv(fragment_path.string(),energy_grid,fragment,7);
+    lines=read_lines(fragment_path);
+    require(lines.size()==3&&lines[1].starts_with("7,1,")&&lines[2].starts_with("7,3,"),
+            "window DOS CSV must omit invalid bins");
+
+    const auto order=wl::WeightedOrderParameter::create({1.0},1.0);
+    const wl::DosGrid joint_grid{{-1.0,1.0,1.0},order.grid};
+    const auto cells=joint_grid.cells();
+    std::vector<double> joint_log_g(cells,nan);
+    std::vector<std::uint64_t> joint_histogram(cells,0);
+    std::vector<double> joint_error(cells,nan);
+    std::vector<std::uint8_t> joint_valid(cells,0);
+    std::vector<std::uint32_t> contributors(cells,0);
+    std::vector<std::int32_t> components(cells,-1);
+    const auto first=joint_grid.flatten(0,1);
+    const auto second=joint_grid.flatten(1,2);
+    for(const auto cell:{first,second}) {
+        joint_log_g[cell]=2.0;
+        joint_histogram[cell]=3;
+        joint_error[cell]=0.5;
+        joint_valid[cell]=1;
+        contributors[cell]=1;
+        components[cell]=0;
+    }
+    const wl::JointDensityOfStates joint{joint_grid,order.normalization,joint_log_g,
+        joint_histogram,joint_error,joint_valid,contributors,components,false};
+    const auto joint_path=directory/"dos2d.csv";
+    wl::write_joint_dos_csv(joint_path.string(),joint);
+    lines=read_lines(joint_path);
+    require(lines.size()==3&&lines[1].starts_with("0,1,")&&lines[2].starts_with("1,2,"),
+            "joint DOS CSV must omit invalid cells without renumbering coordinates");
+
+    const wl::DosFragment joint_fragment{{0,joint_grid.energy_bins()},joint_log_g,
+        joint_histogram,joint_error,joint_valid,joint_grid,contributors,components};
+    const auto joint_fragment_path=directory/"window_dos2d.csv";
+    wl::write_joint_fragment_csv(joint_fragment_path.string(),joint_fragment,
+                                 order.normalization,4);
+    lines=read_lines(joint_fragment_path);
+    require(lines.size()==3&&lines[1].starts_with("4,0,1,")&&
+            lines[2].starts_with("4,1,2,"),"joint window DOS CSV must omit invalid cells");
+    std::filesystem::remove_all(directory);
+}
+
 void test_target_metropolis_initialization() {
     const auto geometry=wl::Geometry::simple_cubic(2,1,1,1.0,{1,0,0},false);
     auto couplings=std::make_shared<wl::DenseCouplings>(geometry,1.0);
@@ -1070,7 +1140,9 @@ int main() {
       {"target_metropolis_initialization",test_target_metropolis_initialization},
       {"csv_geometry_ini",test_csv_geometry_and_ini},
       {"backends_incremental",test_backends_and_incremental_fields},
-      {"energy_grid_windows",test_energy_grid_and_windows},{"walker_checkpoint",test_walker_and_checkpoint},
+      {"energy_grid_windows",test_energy_grid_and_windows},
+      {"sparse_dos_csv_output",test_sparse_dos_csv_output},
+      {"walker_checkpoint",test_walker_and_checkpoint},
       {"forced_acceptance",test_forced_acceptance},
       {"refinement_transition",test_refinement_transition},
       {"histogram_statistics",test_histogram_statistics},
