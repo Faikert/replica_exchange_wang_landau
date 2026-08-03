@@ -1116,8 +1116,15 @@ void test_nalivaiko_refinement_mask() {
     near(inverse.factor(),2.0/100.0,1e-14,
          "Nalivaiko 1/t clock must use cumulative active bins");
     const auto inverse_reset=inverse.histogram_statistics();
-    require(inverse_reset.active_bins==2&&inverse_reset.covered_bins==0,
-            "inverse-time coverage must retain cumulative support after reset");
+    require(inverse_reset.active_bins==0&&inverse_reset.covered_bins==0,
+            "Nalivaiko inverse-time coverage mask must reset with the histogram");
+    require(inverse.active_mask()[0]!=0&&inverse.active_mask()[1]!=0,
+            "Nalivaiko inverse-time reset must preserve cumulative DOS support");
+    inverse.attempt_flip();
+    const auto inverse_visit=inverse.histogram_statistics();
+    require(inverse_visit.active_bins==1&&inverse_visit.covered_bins==1&&
+            inverse_visit.coverage==1.0,
+            "Nalivaiko inverse-time coverage uses only current-iteration bins");
 }
 
 void test_classic_rewl_independence_and_summary() {

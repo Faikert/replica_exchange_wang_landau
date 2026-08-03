@@ -74,9 +74,11 @@ one aligned walker visited it. The 1D DOS and window CSV files therefore also co
 reduction for `[wl] support_stability_checks` histogram-check intervals (default 10). The old
 `[order_parameter]` location of this key remains accepted for compatibility.
 
-With `inverse_time=true`, coverage is evaluated over all cumulatively discovered bins: after
-each histogram reset every known bin must be visited again. `nalivaiko_mod` restricts the scope
-to current-iteration bins only for traditional flatness when `inverse_time=false`.
+With `nalivaiko_mod=false`, inverse-time coverage is evaluated over all cumulatively
+discovered bins: after each histogram reset every known bin must be visited again. With
+`nalivaiko_mod=true`, both flatness and coverage use only bins visited in the current
+iteration. Coverage is therefore normally one, while the cumulative active mask still preserves
+rare bins for relaxed-union stitching, DOS validity, output, and the `1/t` active-cell count.
 
 User-facing work intervals are expressed in Monte Carlo sweeps (MCS): one MCS is `N` attempted single-spin flips per walker, with spins selected randomly with replacement. Fractional MCS values are allowed and resolve to the nearest positive integer number of flip attempts. The preferred keys are `exchange_interval_mcs`, `check_interval_mcs`, `force_accept_after_mcs`, `max_mcs`, and `checkpoint_interval_mcs`. Legacy attempt-based keys remain accepted with a warning and retain their old meaning.
 

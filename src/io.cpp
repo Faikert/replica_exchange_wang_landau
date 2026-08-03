@@ -634,7 +634,8 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         << ", \"flatness\": "<<c.wl.flatness<<", \"flatness_scope\": \"walker_local\""
         << ", \"initial_refinement_criterion\": \""
         <<(c.wl.inverse_time_enabled?
-            "full_coverage_of_discovered_bins":
+            (c.wl.nalivaiko_mod?"full_coverage_of_current_iteration_bins":
+                                "full_coverage_of_discovered_bins"):
             (c.wl.nalivaiko_mod?"histogram_flatness_over_current_iteration_bins":
                                 "histogram_flatness"))<<"\""
         << ", \"nalivaiko_mod\": "<<(c.wl.nalivaiko_mod?"true":"false")
@@ -642,8 +643,8 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         << ", \"return_reference\": \"lowest_energy_supplied_warm_start_or_all_spins_plus_one\""
         << ", \"return_search_updates_production_attempts\": false"
         << ", \"refinement_active_scope\": \""
-        <<((c.wl.nalivaiko_mod&&!c.wl.inverse_time_enabled)?
-            "current_iteration":"cumulative_discovered_bins")<<"\""
+        <<(c.wl.nalivaiko_mod?"current_iteration":
+                              "cumulative_discovered_bins")<<"\""
         << ", \"inverse_time_clock\": \"walker_local_attempted_flips/active_bins\""
         << ", \"dos_synchronization\": \"none\""
         << ", \"refinement_schedule\": \"walker_independent\""

@@ -557,8 +557,7 @@ void WangLandauWalker::update_representatives() {
 
 HistogramStatistics WangLandauWalker::histogram_statistics() const noexcept {
     HistogramStatistics statistics;
-    const bool iteration_scope=parameters_.nalivaiko_mod&&
-                               !parameters_.inverse_time_enabled;
+    const bool iteration_scope=parameters_.nalivaiko_mod;
     const auto& scope=iteration_scope?iteration_cells_:active_cells_;
     statistics.active_bins=scope.size();
     statistics.minimum = std::numeric_limits<std::uint64_t>::max();
