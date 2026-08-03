@@ -75,6 +75,15 @@ if(WL_BUILD_TESTS)
               -DRANKS=2 -DWINDOWS=1
               -P ${CMAKE_SOURCE_DIR}/tests/mpi_output_test.cmake)
     if(NOT MPIEXEC_MAX_NUMPROCS OR MPIEXEC_MAX_NUMPROCS GREATER_EQUAL 4)
+      add_test(NAME wl_mpi_1d_multiwindow_output
+        COMMAND ${CMAKE_COMMAND}
+                -DMPIEXEC=${MPIEXEC_EXECUTABLE}
+                -DNUMPROC_FLAG=${MPIEXEC_NUMPROC_FLAG}
+                -DWL_RUN=$<TARGET_FILE:wl_run>
+                -DGEOMETRY=${CMAKE_SOURCE_DIR}/examples/system.csv
+                -DPREFIX=${CMAKE_CURRENT_BINARY_DIR}/wl_mpi_1d_multiwindow_output
+                -DRANKS=4 -DWINDOWS=2 -DJOINT=FALSE
+                -P ${CMAKE_SOURCE_DIR}/tests/mpi_output_test.cmake)
       add_test(NAME wl_mpi_joint_multiwindow_output
         COMMAND ${CMAKE_COMMAND}
                 -DMPIEXEC=${MPIEXEC_EXECUTABLE}

@@ -48,8 +48,7 @@ Set `[order_parameter] mode = weighted_sum` to sample the signed joint DOS for
 `Q = sum_i q_weight_i*sigma_i`. The geometry CSV must then contain the seventh column
 `q_weight`. Its `bin_width` defines the coarse-grained Q resolution; the symmetric range is
 constructed automatically from `W = sum_i |q_weight_i|`, and output also contains `q=Q/W`.
-Energy windows still partition only E. A newly discovered `(E,Q)` cell delays the next WL
-iteration for `support_stability_checks` histogram-check intervals (default 10).
+Energy windows still partition only E.
 
 ```powershell
 build/Release/wl_run.exe --config examples/run_2d.ini
@@ -67,6 +66,17 @@ metadata, and walker diagnostics are still written, but a global DOS and thermod
 All DOS CSV files are sparse: bins with `valid=0` are omitted, while the original global bin
 indices are retained. Exact-enumeration structural zeros remain present because they are known
 parts of the support (`valid=1`, `log_g=-inf`), rather than unvisited sampling bins.
+
+Both ordinary and joint DOS use the same relaxed-union policy. Walkers are aligned by global
+histogram-weighted least squares over shared finite bins, and a bin remains valid when at least
+one aligned walker visited it. The 1D DOS and window CSV files therefore also contain
+`contributors` and `support_component`. A newly discovered DOS bin delays the next factor
+reduction for `[wl] support_stability_checks` histogram-check intervals (default 10). The old
+`[order_parameter]` location of this key remains accepted for compatibility.
+
+With `inverse_time=true`, coverage is evaluated over all cumulatively discovered bins: after
+each histogram reset every known bin must be visited again. `nalivaiko_mod` restricts the scope
+to current-iteration bins only for traditional flatness when `inverse_time=false`.
 
 User-facing work intervals are expressed in Monte Carlo sweeps (MCS): one MCS is `N` attempted single-spin flips per walker, with spins selected randomly with replacement. Fractional MCS values are allowed and resolve to the nearest positive integer number of flip attempts. The preferred keys are `exchange_interval_mcs`, `check_interval_mcs`, `force_accept_after_mcs`, `max_mcs`, and `checkpoint_interval_mcs`. Legacy attempt-based keys remain accepted with a warning and retain their old meaning.
 

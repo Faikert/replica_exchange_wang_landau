@@ -117,8 +117,8 @@ AlignmentSolution solve_alignment(std::span<const EstimatorView> estimators,
     return result;
 }
 
-DosFragment summarize_joint_union(EnergyWindow window,const DosGrid& layout,
-                                  std::span<const EstimatorView> estimators) {
+DosFragment summarize_relaxed_union(EnergyWindow window,const DosGrid& layout,
+                                    std::span<const EstimatorView> estimators) {
     const auto cells=layout.cells();
     const auto nan=std::numeric_limits<double>::quiet_NaN();
     DosFragment result{window,std::vector<double>(cells,nan),
@@ -155,48 +155,8 @@ DosFragment summarize_joint_union(EnergyWindow window,const DosGrid& layout,
 DosFragment summarize_estimators(EnergyWindow window,const DosGrid& layout,
                                  std::span<const EstimatorView> estimators,
                                  bool allow_empty_intersection) {
-    if(layout.joint()) return summarize_joint_union(window,layout,estimators);
-    const auto cells=layout.cells();
-    const auto nan=std::numeric_limits<double>::quiet_NaN();
-    DosFragment f{window,std::vector<double>(cells,nan),std::vector<std::uint64_t>(cells,0),
-                  std::vector<double>(cells,nan),std::vector<std::uint8_t>(cells,0),
-                  layout,{},{}};
-    const auto begin=layout.flatten(window.begin),end=layout.flatten(window.end);
-    for(std::size_t cell=begin;cell<end;++cell) {
-        bool valid=true;
-        for(const auto& estimator:estimators) {
-            valid=valid&&estimator.active[cell]!=0;
-            f.histogram[cell]+=estimator.histogram[cell];
-        }
-        f.valid[cell]=valid?1:0;
-    }
-    const auto reference=std::find(f.valid.begin()+static_cast<std::ptrdiff_t>(begin),
-                                   f.valid.begin()+static_cast<std::ptrdiff_t>(end),1);
-    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(end)&&allow_empty_intersection)
-        return f;
-    if(reference==f.valid.begin()+static_cast<std::ptrdiff_t>(end))
-        throw InsufficientSupportError(
-            "Walkers in an energy window have no common active bin");
-    const auto reference_cell=static_cast<std::size_t>(reference-f.valid.begin());
-    for(std::size_t cell=begin;cell<end;++cell) {
-        if(f.valid[cell]==0) continue;
-        f.log_g[cell]=0.0;
-        for(const auto& estimator:estimators)
-            f.log_g[cell]+=estimator.log_g[cell]-estimator.log_g[reference_cell];
-        f.log_g[cell]/=static_cast<double>(estimators.size());
-        if(estimators.size()>1) {
-            double squared_deviation=0.0;
-            for(const auto& estimator:estimators) {
-                const auto value=estimator.log_g[cell]-estimator.log_g[reference_cell];
-                const auto delta=value-f.log_g[cell];
-                squared_deviation+=delta*delta;
-            }
-            f.standard_error[cell]=std::sqrt(squared_deviation/
-                (static_cast<double>(estimators.size())*
-                 static_cast<double>(estimators.size()-1)));
-        }
-    }
-    return f;
+    (void)allow_empty_intersection;
+    return summarize_relaxed_union(window,layout,estimators);
 }
 
 DosFragment summarize_impl(EnergyWindow window,
@@ -959,12 +919,10 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                           MPI_UINT64_T,0,leader_comm);
             gather_chunks(local_fragment.valid.data(),all_valid,cells,
                           MPI_UNSIGNED_CHAR,0,leader_comm);
-            if(c.order_parameter) {
-                gather_chunks(local_fragment.contributors.data(),all_contributors,cells,
-                              MPI_UINT32_T,0,leader_comm);
-                gather_chunks(local_fragment.support_component.data(),all_components,cells,
-                              MPI_INT32_T,0,leader_comm);
-            }
+            gather_chunks(local_fragment.contributors.data(),all_contributors,cells,
+                          MPI_UINT32_T,0,leader_comm);
+            gather_chunks(local_fragment.support_component.data(),all_components,cells,
+                          MPI_INT32_T,0,leader_comm);
         }
         const auto local_stat_count=result.walker_statistics.size();
         constexpr std::size_t statistic_integer_fields=10;
@@ -1077,14 +1035,12 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 std::copy_n(all_error.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,
                              f.standard_error.begin());
                 std::copy_n(all_valid.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,f.valid.begin());
-                if(c.order_parameter) {
-                    f.contributors.resize(cells);
-                    f.support_component.resize(cells);
-                    std::copy_n(all_contributors.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,
-                                f.contributors.begin());
-                    std::copy_n(all_components.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,
-                                f.support_component.begin());
-                }
+                f.contributors.resize(cells);
+                f.support_component.resize(cells);
+                std::copy_n(all_contributors.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,
+                            f.contributors.begin());
+                std::copy_n(all_components.begin()+static_cast<std::ptrdiff_t>(dos_offset),cells,
+                            f.support_component.begin());
                 result.fragments.push_back(std::move(f));
                 if(c.wl.collect_window_statistics) {
                     WindowSamplingStatistics sampling_result{

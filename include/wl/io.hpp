@@ -102,7 +102,9 @@ void write_metadata_json(const std::string& path, const RunConfig& config,
                          std::uint64_t exchange_attempted,
                          std::uint64_t exchange_accepted, bool converged, int mpi_size,
                          int openmp_threads,
-                         std::string_view postprocessing_status = "complete");
+                         std::string_view postprocessing_status = "complete",
+                         std::span<const DosFragment> fragments = {},
+                         std::size_t support_components = 0);
 void save_checkpoint(const std::string& path, const WalkerSnapshot& snapshot);
 [[nodiscard]] WalkerSnapshot load_checkpoint(const std::string& path);
 

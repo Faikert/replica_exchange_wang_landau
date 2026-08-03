@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -137,6 +138,8 @@ void apply_ini_setting(RunConfig& c,const std::string& section,const std::string
     else if(full=="wl.inverse_time") c.wl.inverse_time_enabled=boolean(value,full);
     else if(full=="wl.nalivaiko_mod") c.wl.nalivaiko_mod=boolean(value,full);
     else if(full=="wl.return_mode") c.wl.return_mode=boolean(value,full);
+    else if(full=="wl.support_stability_checks")
+        c.wl.support_stability_checks=number<std::size_t>(value,full);
     else if(full=="wl.check_interval") { c.wl.check_interval_attempts=number<std::uint64_t>(value,full); c.check_interval_uses_mcs=false; }
     else if(full=="wl.check_interval_mcs") { c.check_interval_mcs=number<double>(value,full); c.check_interval_uses_mcs=true; }
     else if(full=="wl.force_accept_after") { c.wl.force_accept_after_attempts=number<std::uint64_t>(value,full); c.force_accept_after_uses_mcs=false; }
@@ -271,6 +274,7 @@ void RunConfig::validate(bool require_grid) const {
         progress_interval_seconds < 0.0 || windows == 0 || walkers_per_rank == 0 ||
         overlap < 0.0 || overlap >= 1.0 || exchange_interval_attempts == 0 ||
         wl.check_interval_attempts == 0 || checkpoint_interval_attempts == 0 ||
+        wl.support_stability_checks == 0 ||
         !std::isfinite(wl.round_trip_margin_fraction) ||
         wl.round_trip_margin_fraction<0.0 || wl.round_trip_margin_fraction>=0.5)
         throw std::invalid_argument("Invalid run configuration");
@@ -282,7 +286,7 @@ void RunConfig::validate(bool require_grid) const {
     grid.validate();
     if(order_parameter_mode!="none") {
         if(order_parameter_mode!="weighted_sum"||!order_parameter||
-           !(q_bin_width>0.0)||!std::isfinite(q_bin_width)||wl.support_stability_checks==0)
+           !(q_bin_width>0.0)||!std::isfinite(q_bin_width))
             throw std::invalid_argument("Invalid weighted order-parameter configuration");
         dos_grid().validate();
     }
@@ -414,7 +418,8 @@ std::string usage(std::string_view program) {
       " --emin E --emax E --bin-width dE [--nx N --ny N --nz N]\n"
       "  [--geometry file --box-x L --box-y L --box-z L] [--cutoff R]\n"
       "  [--order-parameter none|weighted_sum --q-bin-width dQ]\n"
-      "  [--support-stability-checks N] (weighted_sum requires CSV q_weight)\n"
+      "  [--support-stability-checks N] delays refinement after any new DOS bin\n"
+      "  weighted_sum requires CSV q_weight\n"
       "  [--config run.ini] (CLI options override INI values)\n"
       "  [--windows N --walkers N --overlap 0.75] [--seed N]\n"
       "  [--adaptive-windows true|false --adaptive-iterations N --adaptive-pilot-mcs MCS]\n"
@@ -438,15 +443,18 @@ std::string usage(std::string_view program) {
 
 void write_dos_csv(const std::string& path, const DensityOfStates& dos) {
     if(dos.histogram.size()!=dos.log_g.size()||dos.standard_error.size()!=dos.log_g.size()||
-       dos.valid.size()!=dos.log_g.size())
+       dos.valid.size()!=dos.log_g.size()||dos.contributors.size()!=dos.log_g.size()||
+       dos.support_component.size()!=dos.log_g.size())
         throw std::invalid_argument("DOS output arrays have different sizes");
     std::ofstream out(path); if (!out) throw std::runtime_error("Cannot write " + path);
-    out << "bin,energy,log_g,histogram,standard_error,valid\n" << std::setprecision(17);
+    out << "bin,energy,log_g,histogram,standard_error,valid,contributors,support_component\n"
+        << std::setprecision(17);
     for (std::size_t i=0;i<dos.log_g.size();++i) {
         if(dos.valid[i]==0) continue;
         out << i << ',' << dos.grid.center(i) << ',' << dos.log_g[i] << ','
             << dos.histogram[i] << ',' << dos.standard_error[i] << ','
-            << static_cast<unsigned>(dos.valid[i]) << '\n';
+            << static_cast<unsigned>(dos.valid[i]) << ',' << dos.contributors[i] << ','
+            << dos.support_component[i] << '\n';
     }
 }
 
@@ -473,15 +481,20 @@ void write_joint_dos_csv(const std::string& path,const JointDensityOfStates& dos
 void write_fragment_csv(const std::string& path, EnergyGrid grid, const DosFragment& f,
                         std::size_t window_id) {
     if(f.histogram.size()!=f.log_g.size()||f.standard_error.size()!=f.log_g.size()||
-       f.valid.size()!=f.log_g.size()||f.window.end>f.log_g.size())
+       f.valid.size()!=f.log_g.size()||f.window.end>f.log_g.size()||
+       (!f.contributors.empty()&&f.contributors.size()!=f.log_g.size())||
+       (!f.support_component.empty()&&f.support_component.size()!=f.log_g.size()))
         throw std::invalid_argument("DOS fragment output arrays have different sizes");
     std::ofstream out(path); if (!out) throw std::runtime_error("Cannot write " + path);
-    out << "window,bin,energy,log_g,histogram,standard_error,valid\n" << std::setprecision(17);
+    out << "window,bin,energy,log_g,histogram,standard_error,valid,contributors,support_component\n"
+        << std::setprecision(17);
     for (auto i=f.window.begin;i<f.window.end;++i) {
         if(f.valid[i]==0) continue;
         out << window_id << ',' << i << ',' << grid.center(i) << ',' << f.log_g[i] << ','
             << f.histogram[i] << ',' << f.standard_error[i] << ','
-            << static_cast<unsigned>(f.valid[i]) << '\n';
+            << static_cast<unsigned>(f.valid[i]) << ','
+            << (f.contributors.empty()?std::uint32_t{1}:f.contributors[i]) << ','
+            << (f.support_component.empty()?std::int32_t{0}:f.support_component[i]) << '\n';
     }
 }
 
@@ -565,10 +578,22 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
                          std::uint64_t forced_accepted,
                          std::uint64_t exchange_attempted, std::uint64_t exchange_accepted,
                          bool converged, int mpi_size, int omp_threads,
-                         std::string_view postprocessing_status) {
+                         std::string_view postprocessing_status,
+                         std::span<const DosFragment> fragments,
+                         std::size_t support_components) {
+    std::map<std::uint32_t,std::size_t> valid_by_contributors;
+    std::size_t fragment_valid_cells=0;
+    for(const auto& fragment:fragments)
+        for(std::size_t cell=0;cell<fragment.valid.size();++cell)
+            if(fragment.valid[cell]) {
+                const auto contributors=fragment.contributors.empty()?std::uint32_t{1}:
+                    fragment.contributors[cell];
+                ++valid_by_contributors[contributors];
+                ++fragment_valid_cells;
+            }
     std::ofstream out(path); if (!out) throw std::runtime_error("Cannot write " + path);
     out << std::setprecision(17)
-        << "{\n  \"format_version\": 6,\n  \"config_file\": \""<<json_escape(c.config_file)<<"\",\n"
+        << "{\n  \"format_version\": 7,\n  \"config_file\": \""<<json_escape(c.config_file)<<"\",\n"
         << "  \"geometry_file\": \""<<json_escape(c.geometry_file)<<"\",\n"
         << "  \"physics\": {\"model\": \"dipolar_ising\", "
         << "\"spins\": "<<couplings.size()<<", \"coupling_scale\": "<<c.coupling_scale<<", \"periodic\": "<<(c.periodic?"true":"false")
@@ -578,8 +603,7 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         << ", \"bin_width\": "<<c.grid.width<<", \"complete_range\": "<<(c.complete_range?"true":"false")<<"},\n"
         << "  \"order_parameter\": {\"mode\": \""<<c.order_parameter_mode<<"\""
         << ", \"weight_source\": \""<<(c.order_parameter?"geometry_csv_q_weight":"none")<<"\""
-        << ", \"bin_width\": "<<c.q_bin_width
-        << ", \"support_stability_checks\": "<<c.wl.support_stability_checks;
+        << ", \"bin_width\": "<<c.q_bin_width;
     if(c.order_parameter) out<<", \"normalization_W\": "<<c.order_parameter->normalization
         <<", \"minimum\": "<<c.order_parameter->grid.minimum
         <<", \"maximum\": "<<c.order_parameter->grid.maximum
@@ -590,17 +614,27 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         <<", \"binder\": \"1-<q^4>/(3*<q^2>^2)\""
         <<", \"moment_coordinate\": \"Q_bin_center\""
         <<", \"marginal_sem\": \"delta_method_without_cell_covariance\""
-        <<", \"invalid_cells\": \"unknown_not_structural_zero\""
-        <<", \"validity_policy\": \"relaxed_union_aligned_support_graph\"";
+        <<", \"invalid_cells\": \"unknown_not_structural_zero\"";
     out<<"},\n"
+        << "  \"dos_support\": {\"validity_policy\": \"relaxed_union\""
+        << ", \"alignment\": \"global_histogram_weighted_least_squares\""
+        << ", \"support_components\": "<<support_components
+        << ", \"window_fragment_valid_cells\": "<<fragment_valid_cells
+        << ", \"window_fragment_valid_cells_by_contributors\": {";
+    bool first_contributor=true;
+    for(const auto& [contributors,count]:valid_by_contributors) {
+        if(!first_contributor) out<<", ";
+        first_contributor=false;
+        out<<'\"'<<contributors<<"\": "<<count;
+    }
+    out<<"}},\n"
         << "  \"algorithm\": {\"variant\": \""<<(c.wl.inverse_time_enabled?"REWL-1/t":"REWL")
         << "\", \"windows\": "<<c.windows
         << ", \"walkers_per_rank\": "<<c.walkers_per_rank<<", \"overlap\": "<<c.overlap
         << ", \"flatness\": "<<c.wl.flatness<<", \"flatness_scope\": \"walker_local\""
         << ", \"initial_refinement_criterion\": \""
         <<(c.wl.inverse_time_enabled?
-            (c.wl.nalivaiko_mod?"full_coverage_of_current_iteration_bins":
-                                "full_coverage_of_discovered_bins"):
+            "full_coverage_of_discovered_bins":
             (c.wl.nalivaiko_mod?"histogram_flatness_over_current_iteration_bins":
                                 "histogram_flatness"))<<"\""
         << ", \"nalivaiko_mod\": "<<(c.wl.nalivaiko_mod?"true":"false")
@@ -608,7 +642,8 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         << ", \"return_reference\": \"lowest_energy_supplied_warm_start_or_all_spins_plus_one\""
         << ", \"return_search_updates_production_attempts\": false"
         << ", \"refinement_active_scope\": \""
-        <<(c.wl.nalivaiko_mod?"current_iteration":"cumulative_discovered_bins")<<"\""
+        <<((c.wl.nalivaiko_mod&&!c.wl.inverse_time_enabled)?
+            "current_iteration":"cumulative_discovered_bins")<<"\""
         << ", \"inverse_time_clock\": \"walker_local_attempted_flips/active_bins\""
         << ", \"dos_synchronization\": \"none\""
         << ", \"refinement_schedule\": \"walker_independent\""
@@ -617,6 +652,7 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         << ", \"minimum_visits_per_walker\": "<<c.wl.minimum_visits
         << ", \"check_interval_mcs\": "<<c.check_interval_mcs
         << ", \"check_interval_attempts\": "<<c.wl.check_interval_attempts
+        << ", \"support_stability_checks\": "<<c.wl.support_stability_checks
         << ", \"final_factor\": "<<c.wl.final_factor
         << ", \"force_accept_after_mcs\": "<<c.force_accept_after_mcs
         << ", \"inverse_time_enabled\": "<<(c.wl.inverse_time_enabled?"true":"false")

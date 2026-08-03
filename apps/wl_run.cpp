@@ -200,6 +200,7 @@ int main(int argc,char** argv) {
         bool postprocessing_failed=false;
         if(parallel.rank()==0) {
             std::string postprocessing_status=result.converged?"complete":"nonconverged";
+            std::size_t support_components=0;
             std::optional<wl::JointDensityOfStates> joint;
             std::optional<wl::DensityOfStates> dos;
             if(config.order_parameter) {
@@ -207,7 +208,9 @@ int main(int argc,char** argv) {
                     joint=wl::stitch_joint_dos(config.dos_grid(),result.fragments,
                         config.complete_range,result.converged,geometry.size(),
                         config.order_parameter->normalization);
+                    support_components=1;
                 } catch(const wl::DisconnectedSupportError& error) {
+                    support_components=error.components();
                     postprocessing_status="disconnected_support";
                     postprocessing_failed=result.converged;
                     std::cerr<<"warning: "<<error.what()
@@ -222,6 +225,13 @@ int main(int argc,char** argv) {
                 try {
                     dos=wl::stitch_dos(config.grid,result.fragments,config.complete_range,
                                        geometry.size());
+                    support_components=1;
+                } catch(const wl::DisconnectedSupportError& error) {
+                    support_components=error.components();
+                    postprocessing_status="disconnected_support";
+                    postprocessing_failed=result.converged;
+                    std::cerr<<"warning: "<<error.what()
+                             <<"; global DOS observables were not written\n";
                 } catch(const wl::InsufficientSupportError& error) {
                     postprocessing_status="insufficient_support";
                     postprocessing_failed=result.converged;
@@ -241,7 +251,7 @@ int main(int argc,char** argv) {
                                     result.attempted,result.accepted,result.forced_accepted,
                                     result.exchange_attempted,result.exchange_accepted,
                                     result.converged,parallel.size(),wl::maximum_openmp_threads(),
-                                    postprocessing_status);
+                                    postprocessing_status,result.fragments,support_components);
             const bool no_global_dos=config.order_parameter?!joint:!dos;
             if(!result.converged||no_global_dos)
                 wl::write_workers_stat_csv(config.output_prefix+"_workers_stat.csv",

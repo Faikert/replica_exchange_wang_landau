@@ -230,7 +230,7 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
         !std::isfinite(parameters_.round_trip_margin_fraction) ||
         parameters_.round_trip_margin_fraction < 0.0 ||
         parameters_.round_trip_margin_fraction >= 0.5 ||
-        (dos_grid_.joint() && parameters_.support_stability_checks==0))
+        parameters_.support_stability_checks==0)
         throw std::invalid_argument("Invalid WL parameters");
     const bool supplied_initial_configuration=!initial_spins.empty();
     if (!supplied_initial_configuration) initial_spins.assign(couplings_->size(), 1);
@@ -557,7 +557,9 @@ void WangLandauWalker::update_representatives() {
 
 HistogramStatistics WangLandauWalker::histogram_statistics() const noexcept {
     HistogramStatistics statistics;
-    const auto& scope=parameters_.nalivaiko_mod?iteration_cells_:active_cells_;
+    const bool iteration_scope=parameters_.nalivaiko_mod&&
+                               !parameters_.inverse_time_enabled;
+    const auto& scope=iteration_scope?iteration_cells_:active_cells_;
     statistics.active_bins=scope.size();
     statistics.minimum = std::numeric_limits<std::uint64_t>::max();
     for(const auto cell:scope) {
@@ -568,7 +570,7 @@ HistogramStatistics WangLandauWalker::histogram_statistics() const noexcept {
         statistics.minimum = 0;
         return statistics;
     }
-    const auto scoped_sum=parameters_.nalivaiko_mod?histogram_sum_:active_histogram_sum_;
+    const auto scoped_sum=iteration_scope?histogram_sum_:active_histogram_sum_;
     statistics.mean=static_cast<double>(scoped_sum)/
                     static_cast<double>(statistics.active_bins);
     statistics.min_over_mean = statistics.mean > 0.0 ?
@@ -596,7 +598,6 @@ bool WangLandauWalker::covered() const {
 bool WangLandauWalker::ready_for_iteration() const {
     if(stage_!=RefinementStage::wang_landau ||
        !(parameters_.inverse_time_enabled?covered():flat())) return false;
-    if(!dos_grid_.joint()) return true;
     const auto checks=parameters_.support_stability_checks;
     const auto interval=parameters_.check_interval_attempts;
     const auto required=checks>std::numeric_limits<std::uint64_t>::max()/interval?

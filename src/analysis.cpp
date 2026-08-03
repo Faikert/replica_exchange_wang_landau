@@ -20,121 +20,18 @@ double log_sum_exp(std::span<const double> values) {
     return maximum + std::log(sum);
 }
 
-double local_slope(const std::vector<double>& values,const std::vector<std::uint8_t>& valid,
-                   std::size_t center,
-                   std::size_t begin, std::size_t end, double width) {
-    const auto lo = center > 2 ? std::max(begin, center - 2) : begin;
-    const auto hi = std::min(end, center + 3);
-    std::size_t count=0;
-    double mean_x = 0.0, mean_y = 0.0;
-    for (auto i = lo; i < hi; ++i) if(valid[i]!=0&&std::isfinite(values[i])) {
-        mean_x += static_cast<double>(i); mean_y += values[i]; ++count;
-    }
-    if(count<2) return std::numeric_limits<double>::quiet_NaN();
-    mean_x /= static_cast<double>(count); mean_y /= static_cast<double>(count);
-    double numerator = 0.0, denominator = 0.0;
-    for (auto i = lo; i < hi; ++i) if(valid[i]!=0&&std::isfinite(values[i])) {
-        const auto dx = static_cast<double>(i) - mean_x;
-        numerator += dx * (values[i] - mean_y); denominator += dx*dx;
-    }
-    return denominator>0.0?numerator/denominator/width:
-        std::numeric_limits<double>::quiet_NaN();
-}
-
 } // namespace
 
 DisconnectedSupportError::DisconnectedSupportError(std::size_t components)
-    : std::runtime_error("Joint DOS support has "+std::to_string(components)+
+    : std::runtime_error("DOS support has "+std::to_string(components)+
                          " disconnected components"),components_(components) {}
 
 DensityOfStates stitch_dos(EnergyGrid grid, std::span<const DosFragment> input,
                            bool complete_range, std::size_t spin_count) {
-    grid.validate();
-    if (input.empty()) throw std::invalid_argument("No DOS fragments supplied");
-    std::vector<DosFragment> fragments(input.begin(), input.end());
-    std::sort(fragments.begin(), fragments.end(), [](const auto& a, const auto& b) {
-        return a.window.begin < b.window.begin;
-    });
-    const auto bins = grid.bins();
-    DensityOfStates result{grid, std::vector<double>(bins, std::numeric_limits<double>::quiet_NaN()),
-                           std::vector<std::uint64_t>(bins, 0),
-                           std::vector<double>(bins,std::numeric_limits<double>::quiet_NaN()),
-                           std::vector<std::uint8_t>(bins,0),{},false};
-    auto first = fragments.front();
-    if (first.log_g.size()!=bins||first.histogram.size()!=bins||
-        first.standard_error.size()!=bins||first.valid.size()!=bins)
-        throw std::invalid_argument("DOS fragment size mismatch");
-    for (std::size_t i = first.window.begin; i < first.window.end; ++i) {
-        result.histogram[i]=first.histogram[i];
-        result.valid[i]=first.valid[i];
-        if(first.valid[i]!=0) {
-            result.log_g[i]=first.log_g[i];
-            result.standard_error[i]=first.standard_error[i];
-        }
-    }
-    auto covered_end = first.window.end;
-    for (std::size_t f = 1; f < fragments.size(); ++f) {
-        auto& right = fragments[f];
-        if (right.log_g.size()!=bins||right.histogram.size()!=bins||
-            right.standard_error.size()!=bins||right.valid.size()!=bins||
-            right.window.begin>=covered_end)
-            throw std::invalid_argument("DOS fragments must overlap and match the global grid");
-        const auto overlap_begin = right.window.begin;
-        const auto overlap_end = std::min(covered_end, right.window.end);
-        const auto midpoint=overlap_begin+(overlap_end-overlap_begin)/2;
-        auto join=overlap_end;
-        auto midpoint_distance=std::numeric_limits<std::size_t>::max();
-        for(auto i=overlap_begin;i<overlap_end;++i)
-            if(result.valid[i]!=0&&right.valid[i]!=0&&std::isfinite(result.log_g[i])&&
-               std::isfinite(right.log_g[i])) {
-                const auto distance=i>midpoint?i-midpoint:midpoint-i;
-                if(distance<midpoint_distance) { midpoint_distance=distance; join=i; }
-            }
-        if(join==overlap_end)
-            throw InsufficientSupportError(
-                "Adjacent DOS fragments have no common valid overlap bin");
-        auto best = std::numeric_limits<double>::infinity();
-        for (auto i = overlap_begin + 2; i + 2 < overlap_end; ++i) {
-            if(result.valid[i]==0||right.valid[i]==0) continue;
-            const auto left_beta=local_slope(result.log_g,result.valid,i,overlap_begin,
-                                             overlap_end,grid.width);
-            const auto right_beta=local_slope(right.log_g,right.valid,i,overlap_begin,
-                                              overlap_end,grid.width);
-            const auto difference = std::abs(left_beta-right_beta);
-            if (std::isfinite(difference) && difference < best) { best = difference; join = i; }
-        }
-        const auto shift = result.log_g[join] - right.log_g[join];
-        result.join_bins.push_back(join);
-        for (std::size_t i = join; i < right.window.end; ++i) {
-            result.histogram[i]=right.histogram[i];
-            result.valid[i]=right.valid[i];
-            if(right.valid[i]!=0) {
-                result.log_g[i]=right.log_g[i]+shift;
-                result.standard_error[i]=right.standard_error[i];
-            } else {
-                result.log_g[i]=std::numeric_limits<double>::quiet_NaN();
-                result.standard_error[i]=std::numeric_limits<double>::quiet_NaN();
-            }
-        }
-        covered_end = std::max(covered_end, right.window.end);
-    }
-    if (complete_range) {
-        if(std::any_of(result.valid.begin(),result.valid.end(),[](const auto value){return value==0;}))
-            throw InsufficientSupportError(
-                "Complete-range normalization requires every DOS bin to be valid");
-        const auto normalization = static_cast<double>(spin_count) * std::log(2.0) -
-                                   log_sum_exp(result.log_g);
-        for(std::size_t i=0;i<bins;++i) if(result.valid[i]!=0) result.log_g[i]+=normalization;
-        result.fully_normalized = true;
-    } else {
-        const auto maximum=log_sum_exp(result.log_g);
-        if(!std::isfinite(maximum))
-            throw InsufficientSupportError("Stitched DOS has no valid bins");
-        auto peak=-std::numeric_limits<double>::infinity();
-        for(std::size_t i=0;i<bins;++i) if(result.valid[i]!=0) peak=std::max(peak,result.log_g[i]);
-        for(std::size_t i=0;i<bins;++i) if(result.valid[i]!=0) result.log_g[i]-=peak;
-    }
-    return result;
+    const auto stitched=stitch_joint_dos(DosGrid{grid,std::nullopt},input,complete_range,
+                                         true,spin_count,1.0);
+    return {grid,stitched.log_g,stitched.histogram,stitched.standard_error,stitched.valid,
+            stitched.contributors,stitched.support_component,{},stitched.fully_normalized};
 }
 
 std::vector<ThermodynamicPoint> thermodynamics(const DensityOfStates& dos,
@@ -190,7 +87,8 @@ DosFragment exact_enumeration(const Couplings& couplings, EnergyGrid grid,
     std::vector<std::uint8_t> valid(grid.bins(),1);
     return {{0, grid.bins()}, std::move(log_g), std::move(counts),
             std::vector<double>(grid.bins(), 0.0),std::move(valid),
-            DosGrid{grid,std::nullopt},{},{}};
+            DosGrid{grid,std::nullopt},std::vector<std::uint32_t>(grid.bins(),1),
+            std::vector<std::int32_t>(grid.bins(),0)};
 }
 
 struct StitchNode {
@@ -309,7 +207,8 @@ DosFragment marginalize_fragment(const DosFragment& joint) {
     const auto nan=std::numeric_limits<double>::quiet_NaN();
     DosFragment result{joint.window,std::vector<double>(e_bins,nan),
         std::vector<std::uint64_t>(e_bins,0),std::vector<double>(e_bins,nan),
-        std::vector<std::uint8_t>(e_bins,0),DosGrid{layout.energy,std::nullopt},{},{}};
+        std::vector<std::uint8_t>(e_bins,0),DosGrid{layout.energy,std::nullopt},
+        std::vector<std::uint32_t>(e_bins,0),std::vector<std::int32_t>(e_bins,-1)};
     std::vector<double> values;
     for(std::size_t e=joint.window.begin;e<joint.window.end;++e) {
         values.clear();
@@ -319,6 +218,10 @@ DosFragment marginalize_fragment(const DosFragment& joint) {
             result.histogram[e]+=joint.histogram[cell];
             if(joint.valid[cell]!=0) {
                 known=true;
+                const auto contributors=joint.contributors.empty()?std::uint32_t{1}:
+                    joint.contributors[cell];
+                result.contributors[e]=std::max(result.contributors[e],contributors);
+                result.support_component[e]=0;
                 if(std::isfinite(joint.log_g[cell])) values.push_back(joint.log_g[cell]);
             }
         }
@@ -344,8 +247,6 @@ DosFragment marginalize_fragment(const DosFragment& joint) {
 }
 
 std::size_t support_component_count(const DosFragment& fragment) {
-    if(!fragment.grid.joint()) return std::any_of(fragment.valid.begin(),fragment.valid.end(),
-        [](auto value){return value!=0;})?1:0;
     if(fragment.valid.size()!=fragment.grid.cells()||
        (!fragment.support_component.empty()&&
         fragment.support_component.size()!=fragment.valid.size()))
@@ -364,8 +265,8 @@ JointDensityOfStates stitch_joint_dos(DosGrid grid,std::span<const DosFragment> 
                                       bool complete_range,bool converged,
                                       std::size_t spin_count,double normalization) {
     grid.validate();
-    if(!grid.joint()||input.empty()||!(normalization>0.0)||!std::isfinite(normalization))
-        throw std::invalid_argument("No valid joint DOS fragments supplied");
+    if(input.empty()||!(normalization>0.0)||!std::isfinite(normalization))
+        throw std::invalid_argument("No valid DOS fragments supplied");
     std::vector<DosFragment> fragments(input.begin(),input.end());
     std::sort(fragments.begin(),fragments.end(),[](const auto& a,const auto& b){
         return a.window.begin<b.window.begin;
@@ -373,11 +274,13 @@ JointDensityOfStates stitch_joint_dos(DosGrid grid,std::span<const DosFragment> 
     const auto cells=grid.cells(),q_bins=grid.q_bins();
     const auto nan=std::numeric_limits<double>::quiet_NaN();
     const auto same_grid=[&](const DosGrid& other) {
-        return other.joint()&&other.energy.minimum==grid.energy.minimum&&
-            other.energy.maximum==grid.energy.maximum&&other.energy.width==grid.energy.width&&
-            other.order_parameter->minimum==grid.order_parameter->minimum&&
-            other.order_parameter->maximum==grid.order_parameter->maximum&&
-            other.order_parameter->width==grid.order_parameter->width;
+        if(other.joint()!=grid.joint()||other.energy.minimum!=grid.energy.minimum||
+           other.energy.maximum!=grid.energy.maximum||other.energy.width!=grid.energy.width)
+            return false;
+        return !grid.joint()||
+            (other.order_parameter->minimum==grid.order_parameter->minimum&&
+             other.order_parameter->maximum==grid.order_parameter->maximum&&
+             other.order_parameter->width==grid.order_parameter->width);
     };
     for(const auto& fragment:fragments) {
         if(!same_grid(fragment.grid)||fragment.window.begin>=fragment.window.end||
@@ -386,11 +289,11 @@ JointDensityOfStates stitch_joint_dos(DosGrid grid,std::span<const DosFragment> 
            fragment.valid.size()!=cells||
            (!fragment.contributors.empty()&&fragment.contributors.size()!=cells)||
            (!fragment.support_component.empty()&&fragment.support_component.size()!=cells))
-            throw std::invalid_argument("Joint DOS fragment layout mismatch");
+            throw std::invalid_argument("DOS fragment layout mismatch");
     }
     for(std::size_t f=1;f<fragments.size();++f)
         if(fragments[f].window.begin>=fragments[f-1].window.end)
-            throw std::invalid_argument("Joint DOS fragments must overlap");
+            throw std::invalid_argument("DOS fragments must overlap");
 
     const auto component_at=[](const DosFragment& fragment,std::size_t cell) {
         return fragment.support_component.empty()?std::int32_t{0}:
@@ -407,7 +310,7 @@ JointDensityOfStates stitch_joint_dos(DosGrid grid,std::span<const DosFragment> 
         const auto end=grid.flatten(fragments[f].window.end);
         for(std::size_t cell=begin;cell<end;++cell) if(fragments[f].valid[cell]) {
             const auto component=component_at(fragments[f],cell);
-            if(component<0) throw std::invalid_argument("Valid joint DOS cell has no support component");
+            if(component<0) throw std::invalid_argument("Valid DOS cell has no support component");
             const auto found=std::find_if(node_lookup[f].begin(),node_lookup[f].end(),
                 [component](const auto& item){return item.first==component;});
             if(found==node_lookup[f].end()) {
@@ -449,7 +352,7 @@ JointDensityOfStates stitch_joint_dos(DosGrid grid,std::span<const DosFragment> 
         const auto found=std::find_if(node_lookup[fragment].begin(),node_lookup[fragment].end(),
             [component](const auto& item){return item.first==component;});
         if(found==node_lookup[fragment].end())
-            throw std::logic_error("Missing joint DOS support node");
+            throw std::logic_error("Missing DOS support node");
         return found->second;
     };
 
@@ -497,15 +400,19 @@ JointDensityOfStates stitch_joint_dos(DosGrid grid,std::span<const DosFragment> 
         covered_end=std::max(covered_end,right.window.end);
     }
     if(complete_range&&converged) {
+        if(!grid.joint()&&std::any_of(result.valid.begin(),result.valid.end(),
+                                     [](const auto value){return value==0;}))
+            throw InsufficientSupportError(
+                "Complete-range normalization requires every DOS bin to be valid");
         const auto log_total=log_sum_exp(result.log_g);
-        if(!std::isfinite(log_total)) throw std::runtime_error("Joint DOS has no finite support");
+        if(!std::isfinite(log_total)) throw std::runtime_error("DOS has no finite support");
         const auto shift=static_cast<double>(spin_count)*std::log(2.0)-log_total;
         for(std::size_t i=0;i<cells;++i) if(result.valid[i]) result.log_g[i]+=shift;
         result.fully_normalized=true;
     } else {
         auto peak=-std::numeric_limits<double>::infinity();
         for(std::size_t i=0;i<cells;++i) if(result.valid[i]&&std::isfinite(result.log_g[i])) peak=std::max(peak,result.log_g[i]);
-        if(!std::isfinite(peak)) throw std::runtime_error("Stitched joint DOS has no valid cells");
+        if(!std::isfinite(peak)) throw std::runtime_error("Stitched DOS has no valid cells");
         for(std::size_t i=0;i<cells;++i) if(result.valid[i]) result.log_g[i]-=peak;
     }
     return result;
@@ -516,7 +423,8 @@ DensityOfStates marginalize(const JointDensityOfStates& joint) {
         joint.standard_error,joint.valid,joint.grid,joint.contributors,joint.support_component};
     const auto marginal=marginalize_fragment(fragment);
     return {joint.grid.energy,marginal.log_g,marginal.histogram,marginal.standard_error,
-        marginal.valid,{},joint.fully_normalized};
+        marginal.valid,marginal.contributors,marginal.support_component,{},
+        joint.fully_normalized};
 }
 
 std::vector<OrderParameterDistributionPoint> order_parameter_distribution(

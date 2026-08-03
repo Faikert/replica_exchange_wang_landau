@@ -14,7 +14,9 @@ wl::DosFragment read_fragment(const std::string& path,const wl::EnergyGrid& grid
                       std::vector<std::uint64_t>(grid.bins(),0),
                       std::vector<double>(grid.bins(),nan),
                       std::vector<std::uint8_t>(grid.bins(),0),
-                      wl::DosGrid{grid,std::nullopt},{},{}};
+                      wl::DosGrid{grid,std::nullopt},
+                      std::vector<std::uint32_t>(grid.bins(),0),
+                      std::vector<std::int32_t>(grid.bins(),-1)};
     std::string line; std::getline(in,line);
     while(std::getline(in,line)) {
         std::stringstream row(line); std::string value; std::vector<std::string> fields;
@@ -26,9 +28,14 @@ wl::DosFragment read_fragment(const std::string& path,const wl::EnergyGrid& grid
         f.standard_error[bin]=std::stod(fields[5]);
         f.valid[bin]=fields.size()>=7?static_cast<std::uint8_t>(std::stoul(fields[6])!=0):
             static_cast<std::uint8_t>(std::isfinite(f.log_g[bin])&&f.histogram[bin]!=0);
+        f.contributors[bin]=fields.size()>=8?static_cast<std::uint32_t>(std::stoul(fields[7])):1;
+        f.support_component[bin]=fields.size()>=9?static_cast<std::int32_t>(
+            std::stol(fields[8])):0;
         if(f.valid[bin]==0) {
             f.log_g[bin]=nan;
             f.standard_error[bin]=nan;
+            f.contributors[bin]=0;
+            f.support_component[bin]=-1;
         }
     }
     if(f.window.begin>=f.window.end) throw std::runtime_error("Empty fragment "+path);

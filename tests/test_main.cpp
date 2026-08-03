@@ -49,7 +49,7 @@ void test_csv_geometry_and_ini() {
         <<"minimum_width=1.25\ndiffusivity_floor_fraction=0.08\ncurvature_weight=0.4\n"
         <<"round_trip_target=3\nmaximum_round_trip_penalty=2.5\nround_trip_margin_fraction=0.15\n"
         <<"[wl]\ncheck_interval_mcs=2.5\nforce_accept_after_mcs=3.5\ninverse_time=false\n"
-        <<"nalivaiko_mod=true\nreturn_mode=true\n"
+        <<"nalivaiko_mod=true\nreturn_mode=true\nsupport_stability_checks=4\n"
         <<"[initialization]\nmax_attempts=123\ntarget_fraction=0.4\ntemperature_fraction=0.07\n"
         <<"stall_attempts_per_spin=17\ntemperature_multiplier=3\nmax_temperature_fraction=0.4\n"
         <<"[run]\nseed=17\nmax_mcs=4.5\ncheckpoint_interval_mcs=5.5\nprogress=2\n"
@@ -74,6 +74,7 @@ void test_csv_geometry_and_ini() {
     require(!config.wl.inverse_time_enabled,"INI inverse-time switch");
     require(config.wl.nalivaiko_mod,"INI Nalivaiko modification switch");
     require(config.wl.return_mode,"INI return-mode switch");
+    require(config.wl.support_stability_checks==4,"common WL support-stability setting");
     require(config.wl.initialization_max_attempts==123,"INI initialization attempts");
     near(config.wl.initialization_target_fraction,0.4,1e-14,"INI initialization target");
     near(config.wl.initialization_temperature_fraction,0.07,1e-14,
@@ -133,7 +134,10 @@ void test_csv_geometry_and_ini() {
     require(metadata.find("\"nalivaiko_mod\": true")!=std::string::npos&&
             metadata.find("\"return_mode\": true")!=std::string::npos&&
             metadata.find("\"refinement_active_scope\": \"current_iteration\"")!=
-                std::string::npos,
+                std::string::npos&&
+            metadata.find("\"format_version\": 7")!=std::string::npos&&
+            metadata.find("\"validity_policy\": \"relaxed_union\"")!=std::string::npos&&
+            metadata.find("\"support_stability_checks\": 4")!=std::string::npos,
             "Nalivaiko mode must be recorded in metadata");
     std::filesystem::remove_all(directory);
 }
@@ -182,11 +186,15 @@ void test_sparse_dos_csv_output() {
     const std::vector<std::uint64_t> histogram{0,5,0,0};
     const std::vector<double> standard_error{nan,0.25,nan,0.0};
     const std::vector<std::uint8_t> valid{0,1,0,1};
-    const wl::DensityOfStates dos{energy_grid,log_g,histogram,standard_error,valid,{},false};
+    const wl::DensityOfStates dos{energy_grid,log_g,histogram,standard_error,valid,
+        std::vector<std::uint32_t>(log_g.size(),1),
+        std::vector<std::int32_t>(log_g.size(),0),{},false};
     const auto dos_path=directory/"dos.csv";
     wl::write_dos_csv(dos_path.string(),dos);
     auto lines=read_lines(dos_path);
-    require(lines.size()==3&&lines[1].starts_with("1,")&&lines[2].starts_with("3,"),
+    require(lines.size()==3&&
+            lines[0]=="bin,energy,log_g,histogram,standard_error,valid,contributors,support_component"&&
+            lines[1].starts_with("1,")&&lines[2].starts_with("3,"),
             "DOS CSV must omit invalid bins without renumbering valid bins");
     require(lines[2].find(",-inf,0,0,1")!=std::string::npos,
             "known structural-zero DOS bins must remain in output");
@@ -196,7 +204,9 @@ void test_sparse_dos_csv_output() {
     const auto fragment_path=directory/"window.csv";
     wl::write_fragment_csv(fragment_path.string(),energy_grid,fragment,7);
     lines=read_lines(fragment_path);
-    require(lines.size()==3&&lines[1].starts_with("7,1,")&&lines[2].starts_with("7,3,"),
+    require(lines.size()==3&&
+            lines[0]=="window,bin,energy,log_g,histogram,standard_error,valid,contributors,support_component"&&
+            lines[1].starts_with("7,1,")&&lines[2].starts_with("7,3,"),
             "window DOS CSV must omit invalid bins");
 
     const auto order=wl::WeightedOrderParameter::create({1.0},1.0);
@@ -361,6 +371,7 @@ void test_return_mode() {
     const wl::EnergyGrid grid{-2.5,3.5,1.0};
     wl::WlParameters parameters{0.1,1,0.1,1};
     parameters.inverse_time_enabled=false;
+    parameters.support_stability_checks=1;
     parameters.return_mode=true;
     parameters.initialization_max_attempts=100;
     const std::vector<std::int8_t> reference{1,1};
@@ -368,6 +379,9 @@ void test_return_mode() {
 
     wl::WangLandauWalker lowest(201,couplings,grid,{0,grid.bins()},parameters,17,
                                 excited,reference);
+    auto lowest_state=lowest.snapshot();
+    lowest_state.attempted=1;
+    lowest.restore(lowest_state);
     require(lowest.ready_for_iteration(),"return-mode test iteration must be ready");
     const auto attempted_before=lowest.attempted();
     lowest.begin_next_iteration();
@@ -387,11 +401,15 @@ void test_return_mode() {
     const wl::EnergyWindow upper{*excited_bin,*excited_bin+1};
     wl::WangLandauWalker upper_walker(202,couplings,grid,upper,parameters,19,
                                       excited,reference);
+    auto upper_state=upper_walker.snapshot();
+    upper_state.attempted=1;
+    upper_walker.restore(upper_state);
+    const auto upper_attempted_before=upper_walker.attempted();
     require(upper_walker.ready_for_iteration(),"upper return-mode iteration must be ready");
     upper_walker.begin_next_iteration();
     require(upper_walker.energy_bin()&&upper.contains(*upper_walker.energy_bin()),
             "return mode must search from the reference state back into a higher window");
-    require(upper_walker.attempted()==0,
+    require(upper_walker.attempted()==upper_attempted_before,
             "higher-window return search must not increment production attempts");
     const auto exact_fields=wl::local_fields(*couplings,upper_walker.spins());
     require(std::equal(upper_walker.fields().begin(),upper_walker.fields().end(),
@@ -403,6 +421,9 @@ void test_return_mode() {
     disabled.return_mode=false;
     wl::WangLandauWalker ordinary(203,couplings,grid,{0,grid.bins()},disabled,17,excited,
                                   reference);
+    auto ordinary_state=ordinary.snapshot();
+    ordinary_state.attempted=1;
+    ordinary.restore(ordinary_state);
     ordinary.begin_next_iteration();
     require(std::equal(ordinary.spins().begin(),ordinary.spins().end(),excited.begin()),
             "disabled return mode must preserve the current configuration");
@@ -1038,12 +1059,14 @@ void test_nalivaiko_refinement_mask() {
     wl::EnergyGrid grid{-1,1,0.5};
     wl::WlParameters parameters{0.8,1,1e-8,1,0,false};
     parameters.nalivaiko_mod=true;
+    parameters.support_stability_checks=1;
     wl::WangLandauWalker walker(40,couplings,grid,{0,grid.bins()},parameters,23);
     auto snapshot=walker.snapshot();
     std::fill(snapshot.active.begin(),snapshot.active.end(),0);
     std::fill(snapshot.histogram.begin(),snapshot.histogram.end(),0);
     snapshot.active[0]=snapshot.active[1]=1;
     snapshot.histogram[0]=snapshot.histogram[1]=10;
+    snapshot.attempted=1;
     walker.restore(snapshot);
     require(walker.ready_for_iteration(),"Nalivaiko stage must initially satisfy flatness");
     walker.begin_next_iteration();
@@ -1076,6 +1099,7 @@ void test_nalivaiko_refinement_mask() {
 
     wl::WlParameters inverse_parameters{0.99,100,1e-8,1};
     inverse_parameters.nalivaiko_mod=true;
+    inverse_parameters.support_stability_checks=1;
     wl::WangLandauWalker inverse(41,couplings,grid,{0,grid.bins()},inverse_parameters,29);
     auto inverse_snapshot=inverse.snapshot();
     std::fill(inverse_snapshot.active.begin(),inverse_snapshot.active.end(),0);
@@ -1091,14 +1115,16 @@ void test_nalivaiko_refinement_mask() {
             "Nalivaiko walker must enter inverse-time refinement");
     near(inverse.factor(),2.0/100.0,1e-14,
          "Nalivaiko 1/t clock must use cumulative active bins");
-    require(inverse.histogram_statistics().active_bins==0,
-            "Nalivaiko refinement mask must also reset on the 1/t transition");
+    const auto inverse_reset=inverse.histogram_statistics();
+    require(inverse_reset.active_bins==2&&inverse_reset.covered_bins==0,
+            "inverse-time coverage must retain cumulative support after reset");
 }
 
 void test_classic_rewl_independence_and_summary() {
     auto couplings=std::make_shared<wl::DenseCouplings>(
         wl::Geometry::simple_cubic(1,1,1,1.0,{0,0,1},false),1.0);
     wl::WlParameters parameters{0.8,1,0.01,1,0,false};
+    parameters.support_stability_checks=1;
     wl::EnergyGrid grid{-1,1,0.5};
     const wl::EnergyWindow window{0,grid.bins()};
     wl::WangLandauWalker first(10,couplings,grid,window,parameters,17);
@@ -1120,6 +1146,7 @@ void test_classic_rewl_independence_and_summary() {
     first_snapshot=first.snapshot();
     first_snapshot.histogram[0]=100; first_snapshot.histogram[1]=100;
     first_snapshot.log_g[0]=2.0; first_snapshot.log_g[1]=5.0;
+    first_snapshot.attempted=1;
     first.restore(first_snapshot);
     const auto first_log_g=first.log_g();
     const auto second_before=second.snapshot();
@@ -1141,19 +1168,22 @@ void test_classic_rewl_independence_and_summary() {
     first_snapshot.active[0]=first_snapshot.active[1]=first_snapshot.active[2]=1;
     second_snapshot.active[1]=second_snapshot.active[2]=second_snapshot.active[3]=1;
     first_snapshot.log_g[1]=10.0; first_snapshot.log_g[2]=14.0;
-    second_snapshot.log_g[1]=-3.0; second_snapshot.log_g[2]=3.0;
+    second_snapshot.log_g[1]=-3.0; second_snapshot.log_g[2]=1.0;
     first_snapshot.histogram[2]=7; second_snapshot.histogram[2]=9;
     first.restore(first_snapshot); second.restore(second_snapshot);
     const wl::WangLandauWalker* walkers[]{&first,&second};
     const auto fragment=wl::summarize_walkers(window,walkers,grid.bins());
-    require(fragment.valid[0]==0&&fragment.valid[1]==1&&fragment.valid[2]==1&&
-            fragment.valid[3]==0,"summary uses active-mask intersection");
-    near(fragment.log_g[1],0.0,1e-14,"summary reference bin");
-    near(fragment.log_g[2],5.0,1e-14,"summary aligned mean");
-    near(fragment.standard_error[2],1.0,1e-14,"summary analytic SEM");
+    require(fragment.valid[0]==1&&fragment.valid[1]==1&&fragment.valid[2]==1&&
+            fragment.valid[3]==1,"summary uses aligned active-mask union");
+    near(fragment.log_g[1],10.0,1e-14,"summary weighted alignment");
+    near(fragment.log_g[2],14.0,1e-14,"summary aligned mean");
+    near(fragment.standard_error[2],0.0,1e-14,"summary analytic SEM");
     require(fragment.histogram[2]==16,"summary histogram sum");
-    require(std::isnan(fragment.log_g[0])&&std::isnan(fragment.standard_error[0]),
-            "summary invalid bins are NaN");
+    require(fragment.contributors[0]==1&&fragment.contributors[1]==2&&
+            fragment.contributors[2]==2&&fragment.contributors[3]==1,
+            "summary retains single-contributor edge bins");
+    require(std::isnan(fragment.standard_error[0])&&std::isnan(fragment.standard_error[3]),
+            "single-contributor SEM is undefined");
 
     const wl::WangLandauWalker* single[]{&first};
     const auto single_fragment=wl::summarize_walkers(window,single,grid.bins());
@@ -1192,22 +1222,55 @@ void test_classic_rewl_independence_and_summary() {
     second_snapshot=second.snapshot();
     std::fill(second_snapshot.active.begin(),second_snapshot.active.end(),0);
     second_snapshot.active[3]=1; second.restore(second_snapshot);
-    bool rejected=false;
-    try { (void)wl::summarize_walkers(window,walkers,grid.bins()); }
-    catch(const std::runtime_error&) { rejected=true; }
-    require(rejected,"summary must reject walkers without a common active bin");
     const auto diagnostic_fragment=
         wl::summarize_walkers(window,walkers,grid.bins(),true);
-    require(std::none_of(diagnostic_fragment.valid.begin(),diagnostic_fragment.valid.end(),
-                         [](auto value){return value!=0;}),
-            "diagnostic summary preserves an empty intersection for output");
-    bool insufficient=false;
+    require(std::all_of(diagnostic_fragment.valid.begin(),diagnostic_fragment.valid.end(),
+                        [](auto value){return value!=0;})&&
+            wl::support_component_count(diagnostic_fragment)==2,
+            "disconnected summary preserves both support components");
+    bool disconnected=false;
     try {
         (void)wl::stitch_dos(grid,std::span(&diagnostic_fragment,1),false,1);
-    } catch(const wl::InsufficientSupportError&) {
-        insufficient=true;
+    } catch(const wl::DisconnectedSupportError& error) {
+        disconnected=error.components()==2;
     }
-    require(insufficient,"empty diagnostic support has a typed postprocessing status");
+    require(disconnected,"disconnected 1D support has a typed postprocessing status");
+}
+
+void test_1d_relaxed_union_window_chain() {
+    const wl::EnergyGrid grid{0.0,6.0,1.0};
+    const auto make_fragment=[&](wl::EnergyWindow window,double offset) {
+        const auto bins=grid.bins();
+        const auto nan=std::numeric_limits<double>::quiet_NaN();
+        wl::DosFragment fragment{window,std::vector<double>(bins,nan),
+            std::vector<std::uint64_t>(bins,0),std::vector<double>(bins,nan),
+            std::vector<std::uint8_t>(bins,0),wl::DosGrid{grid,std::nullopt},
+            std::vector<std::uint32_t>(bins,0),std::vector<std::int32_t>(bins,-1)};
+        for(std::size_t bin=window.begin;bin<window.end;++bin) {
+            fragment.log_g[bin]=static_cast<double>(bin)+offset;
+            fragment.histogram[bin]=10+bin;
+            fragment.valid[bin]=1;
+            fragment.contributors[bin]=1;
+            fragment.support_component[bin]=0;
+        }
+        return fragment;
+    };
+    const std::array fragments{
+        make_fragment({0,3},0.0),
+        make_fragment({2,5},-10.0),
+        make_fragment({4,6},7.0)};
+    const auto dos=wl::stitch_dos(grid,fragments,false,1);
+    require(std::all_of(dos.valid.begin(),dos.valid.end(),[](auto value){return value!=0;}),
+            "neighbor-window chain retains the full 1D union");
+    for(std::size_t bin=0;bin<grid.bins();++bin)
+        near(dos.log_g[bin],static_cast<double>(bin)-5.0,1e-13,
+             "neighbor-window weighted alignment");
+    require(dos.contributors[0]==1&&dos.contributors[2]==2&&
+            dos.contributors[4]==2&&dos.contributors[5]==1,
+            "inter-window contributor counts");
+    require(std::all_of(dos.support_component.begin(),dos.support_component.end(),
+                        [](auto component){return component==0;}),
+            "neighbor-window chain forms one global component");
 }
 }
 
@@ -1226,6 +1289,7 @@ int main() {
       {"histogram_statistics",test_histogram_statistics},
       {"nalivaiko_refinement_mask",test_nalivaiko_refinement_mask},
       {"classic_rewl_independence_summary",test_classic_rewl_independence_and_summary},
+      {"1d_relaxed_union_window_chain",test_1d_relaxed_union_window_chain},
       {"unlimited_max_attempts",test_unlimited_max_attempts},
       {"exact_thermo",test_exact_enumeration_and_thermo},
       {"joint_dos_order_parameter",test_joint_dos_and_order_parameter},

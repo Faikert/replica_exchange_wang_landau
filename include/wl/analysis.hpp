@@ -48,6 +48,8 @@ struct DensityOfStates {
     std::vector<std::uint64_t> histogram;
     std::vector<double> standard_error;
     std::vector<std::uint8_t> valid;
+    std::vector<std::uint32_t> contributors;
+    std::vector<std::int32_t> support_component;
     std::vector<std::size_t> join_bins;
     bool fully_normalized{false};
 };
