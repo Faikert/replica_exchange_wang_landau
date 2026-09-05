@@ -131,7 +131,7 @@ User-facing work intervals are expressed in Monte Carlo sweeps (MCS): one MCS is
 
 Exact attempted-flip counts are still stored because histogram updates, checkpoint restart, and the internal `1/t` refinement use one update per proposal. Metadata and runtime output contain both MCS and resolved flip-attempt counts.
 
-Use `--progress 2` or `[run] progress = 2` to refresh a single console line approximately every two seconds; `progress = 0` disables it. With `inverse_time=true`, the line reports the minimum current-stage coverage; traditional WL runs report histogram flatness. It also contains MCS, the largest modification factor, `WL/1t/frozen` counts, cumulative initialization work, and the slowest WL walker with its window, coverage, factor, time since its last refinement step, current energy, and up to eight missing energy or `(E,Q)` cells. The timer is checked between exchange batches, so a long `exchange_interval_mcs` can delay an update. MPI aggregates the values and rank 0 prints the selected global slowest walker.
+Use `--progress 2` or `[run] progress = 2` to refresh a single console line approximately every two seconds; `progress = 0` disables it. With `inverse_time=true`, the line reports the minimum current-stage coverage; traditional WL runs report histogram flatness. It also contains attempted flips per walker, the largest modification factor, and `WL/1t/frozen` counts. The timer is checked between exchange batches, so a long `exchange_interval_mcs` can delay an update. MPI aggregates the values and only rank 0 prints the line. Detailed per-walker and missing-bin diagnostics remain available in the output CSV files.
 
 ```powershell
 build/Release/wl_run.exe --nx 2 --ny 2 --nz 2 `

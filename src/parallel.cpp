@@ -824,40 +824,24 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 double local_progress_factor=0.0;
                 double local_progress_flatness=1.0;
                 std::uint64_t local_stage_counts[3]{};
-                std::uint64_t local_search_attempts=0;
-                double local_search_seconds=0.0;
-                const WangLandauWalker* diagnostic_walker=nullptr;
-                std::size_t diagnostic_window=0;
-                double diagnostic_coverage=std::numeric_limits<double>::infinity();
                 for(std::size_t w=first_window;w<last_window;++w) {
                     const auto& group=groups[w];
                     local_progress_attempted=std::max(local_progress_attempted,group.front()->attempted());
-                    for(std::size_t local=0;local<group.size();++local) {
-                        const auto& walker=group[local];
+                    for(const auto& walker:group) {
                         local_progress_factor=std::max(local_progress_factor,walker->factor());
                         const auto stage=walker->stage();
                         ++local_stage_counts[stage==RefinementStage::wang_landau?0:
                                              stage==RefinementStage::inverse_time?1:2];
-                        local_search_attempts+=walker->initialization_attempts();
-                        local_search_seconds+=walker->initialization_seconds();
                         if(stage==RefinementStage::wang_landau) {
                             const auto h=walker->histogram_statistics();
                             const auto criterion=c.wl.inverse_time_enabled?h.coverage:h.min_over_mean;
                             local_progress_flatness=std::min(local_progress_flatness,criterion);
-                            if(!diagnostic_walker || criterion<diagnostic_coverage ||
-                               (criterion==diagnostic_coverage && walker->attempts_since_last_iteration()>
-                                                                   diagnostic_walker->attempts_since_last_iteration())) {
-                                diagnostic_walker=walker.get(); diagnostic_window=w;
-                                diagnostic_coverage=criterion;
-                            }
                         }
                     }
                 }
                 auto progress_attempted=local_progress_attempted;
                 auto progress_factor=local_progress_factor;
                 auto progress_flatness=local_progress_flatness;
-                auto search_attempts=local_search_attempts;
-                auto search_seconds=local_search_seconds;
                 std::uint64_t stage_counts[3]{local_stage_counts[0],local_stage_counts[1],
                                               local_stage_counts[2]};
 #ifdef WL_HAS_MPI
@@ -866,39 +850,10 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                                MPI_COMM_WORLD);
                     MPI_Reduce(&local_progress_factor,&progress_factor,1,MPI_DOUBLE,MPI_MAX,0,
                                MPI_COMM_WORLD);
-                    MPI_Allreduce(&local_progress_flatness,&progress_flatness,1,MPI_DOUBLE,MPI_MIN,
-                                  MPI_COMM_WORLD);
-                    MPI_Reduce(&local_search_attempts,&search_attempts,1,MPI_UINT64_T,MPI_SUM,0,MPI_COMM_WORLD);
-                    MPI_Reduce(&local_search_seconds,&search_seconds,1,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
+                    MPI_Reduce(&local_progress_flatness,&progress_flatness,1,MPI_DOUBLE,MPI_MIN,0,
+                               MPI_COMM_WORLD);
                     MPI_Reduce(local_stage_counts,stage_counts,3,MPI_UINT64_T,MPI_SUM,0,
                                MPI_COMM_WORLD);
-                }
-#endif
-                // Select one worst WL walker globally; MPI remains outside OpenMP regions.
-                int diagnostic_owner=diagnostic_walker?context.rank():context.size();
-#ifdef WL_HAS_MPI
-                if(distributed) {
-                    const int candidate=diagnostic_walker && diagnostic_coverage==progress_flatness?
-                        context.rank():context.size();
-                    MPI_Allreduce(&candidate,&diagnostic_owner,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD);
-                }
-#endif
-                std::array<std::uint64_t,15> detail{};
-                std::array<double,3> detail_values{};
-                if(diagnostic_owner<context.size() && context.rank()==diagnostic_owner) {
-                    const auto d=collect_walker_statistics(*diagnostic_walker,diagnostic_window,context.rank());
-                    const auto missing=missing_histogram_cells(*diagnostic_walker);
-                    detail[0]=d.window_id; detail[1]=d.walker_id;
-                    detail[2]=d.cumulative_covered_bins; detail[3]=d.cumulative_active_bins;
-                    detail[4]=d.attempts_since_last_iteration; detail[5]=missing.size();
-                    detail[6]=std::min<std::size_t>(missing.size(),8);
-                    for(std::size_t i=0;i<detail[6];++i) detail[7+i]=missing[i];
-                    detail_values={d.factor,d.seconds_since_last_iteration,d.energy};
-                }
-#ifdef WL_HAS_MPI
-                if(distributed && diagnostic_owner<context.size()) {
-                    MPI_Bcast(detail.data(),static_cast<int>(detail.size()),MPI_UINT64_T,diagnostic_owner,MPI_COMM_WORLD);
-                    MPI_Bcast(detail_values.data(),static_cast<int>(detail_values.size()),MPI_DOUBLE,diagnostic_owner,MPI_COMM_WORLD);
                 }
 #endif
                 if(context.rank()==0) {
@@ -908,23 +863,7 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                         <<" attempted_flips_per_walker="<<progress_attempted
                         <<(c.wl.inverse_time_enabled?" coverage=":" flatness=")
                         <<progress_flatness<<" factor="<<progress_factor
-                        <<" stages="<<stage_counts[0]<<'/'<<stage_counts[1]<<'/'<<stage_counts[2]
-                        <<" search_attempts="<<search_attempts<<" search_worker_seconds="<<search_seconds;
-                    if(diagnostic_owner<context.size()) {
-                        line<<" slowest_rank="<<diagnostic_owner<<" window="<<detail[0]<<" walker="<<detail[1]
-                            <<" covered="<<detail[2]<<'/'<<detail[3]<<" walker_factor="<<detail_values[0]
-                            <<" waiting_mcs="<<static_cast<double>(detail[4])/static_cast<double>(couplings->size())
-                            <<" waiting_seconds="<<detail_values[1]<<" energy="<<detail_values[2]
-                            <<(c.dos_grid().joint()?" missing_EQ=[":" missing_energy_centers=[");
-                        for(std::size_t i=0;i<detail[6];++i) {
-                            if(i) line<<';';
-                            const auto cell=static_cast<std::size_t>(detail[7+i]);
-                            line<<c.grid.center(c.dos_grid().energy_bin(cell));
-                            if(c.dos_grid().joint()) line<<':'<<c.dos_grid().order_parameter->center(c.dos_grid().q_bin(cell));
-                        }
-                        if(detail[5]>detail[6]) line<<";...";
-                        line<<"] missing_count="<<detail[5];
-                    }
+                        <<" stages="<<stage_counts[0]<<'/'<<stage_counts[1]<<'/'<<stage_counts[2];
                     const auto text=line.str();
                     std::cout<<'\r'<<text;
                     if(progress_line_width>text.size())
