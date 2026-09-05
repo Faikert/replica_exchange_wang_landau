@@ -23,6 +23,8 @@ private:
 struct RewlResult {
     std::vector<DosFragment> fragments;
     std::vector<WalkerStatistics> walker_statistics;
+    std::vector<MissingBin> missing_bins;
+    std::vector<ExchangeStatistics> exchange_statistics;
     std::vector<WindowSamplingStatistics> sampling_statistics;
     std::vector<EnergyRepresentative> representatives;
     std::uint64_t attempted{}, accepted{}, forced_accepted{};

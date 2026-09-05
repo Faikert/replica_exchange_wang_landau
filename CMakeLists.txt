@@ -17,7 +17,7 @@ add_library(wl_algorithm src/wang_landau.cpp src/analysis.cpp)
 target_include_directories(wl_algorithm PUBLIC include)
 target_link_libraries(wl_algorithm PUBLIC wl_physics)
 
-add_library(wl_io src/io.cpp)
+add_library(wl_io src/io.cpp src/diagnostics.cpp)
 target_include_directories(wl_io PUBLIC include)
 target_link_libraries(wl_io PUBLIC wl_algorithm)
 

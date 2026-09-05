@@ -13,6 +13,9 @@
 #include <numeric>
 #include <stdexcept>
 #include <vector>
+#ifdef WL_HAS_OPENMP
+#include <omp.h>
+#endif
 
 namespace {
 void require(bool condition,const char* message) { if(!condition) throw std::runtime_error(message); }
@@ -49,7 +52,7 @@ void test_csv_geometry_and_ini() {
         <<"minimum_width=1.25\ndiffusivity_floor_fraction=0.08\ncurvature_weight=0.4\n"
         <<"round_trip_target=3\nmaximum_round_trip_penalty=2.5\nround_trip_margin_fraction=0.15\n"
         <<"[wl]\ncheck_interval_mcs=2.5\nforce_accept_after_mcs=3.5\ninverse_time=false\n"
-        <<"nalivaiko_mod=true\nreturn_mode=true\nsupport_stability_checks=4\n"
+        <<"nalivaiko_mod=true\nreturn_mode=true\nreturn_scope=lowest_window\nsupport_stability_checks=4\n"
         <<"[initialization]\nmax_attempts=123\ntarget_fraction=0.4\ntemperature_fraction=0.07\n"
         <<"stall_attempts_per_spin=17\ntemperature_multiplier=3\nmax_temperature_fraction=0.4\n"
         <<"[run]\nseed=17\nmax_mcs=4.5\ncheckpoint_interval_mcs=5.5\nprogress=2\n"
@@ -74,6 +77,7 @@ void test_csv_geometry_and_ini() {
     require(!config.wl.inverse_time_enabled,"INI inverse-time switch");
     require(config.wl.nalivaiko_mod,"INI Nalivaiko modification switch");
     require(config.wl.return_mode,"INI return-mode switch");
+    require(config.return_scope=="lowest_window","INI return scope");
     require(config.wl.support_stability_checks==4,"common WL support-stability setting");
     require(config.wl.initialization_max_attempts==123,"INI initialization attempts");
     near(config.wl.initialization_target_fraction,0.4,1e-14,"INI initialization target");
@@ -104,6 +108,15 @@ void test_csv_geometry_and_ini() {
     near(progress.progress_interval_seconds,3.0,1e-14,"CLI progress interval");
     require(progress.wl.inverse_time_enabled,"CLI inverse-time switch");
     require(!progress.wl.nalivaiko_mod,"Nalivaiko modification default");
+    require(progress.return_scope=="all_windows","legacy return scope default");
+    std::vector<std::string> scope_arguments{"test","--return-mode","true","--return-scope","lowest_window"};
+    std::vector<char*> scope_argv; for(auto& a:scope_arguments) scope_argv.push_back(a.data());
+    auto scoped=wl::parse_arguments(static_cast<int>(scope_argv.size()),scope_argv.data());
+    require(scoped.return_scope=="lowest_window" && scoped.wl.return_mode,"CLI return scope");
+    scoped.return_scope="misspelled";
+    bool scope_rejected=false;
+    try { scoped.validate(false); } catch(const std::invalid_argument&) { scope_rejected=true; }
+    require(scope_rejected,"invalid return scope rejected");
     std::vector<std::string> no_progress_arguments{"test","--progress","0"};
     std::vector<char*> no_progress_argv; for(auto& argument:no_progress_arguments) no_progress_argv.push_back(argument.data());
     require(wl::parse_arguments(static_cast<int>(no_progress_argv.size()),no_progress_argv.data()).progress_interval_seconds==0.0,
@@ -133,9 +146,10 @@ void test_csv_geometry_and_ini() {
     metadata_input.close();
     require(metadata.find("\"nalivaiko_mod\": true")!=std::string::npos&&
             metadata.find("\"return_mode\": true")!=std::string::npos&&
+            metadata.find("\"return_scope\": \"lowest_window\"")!=std::string::npos&&
             metadata.find("\"refinement_active_scope\": \"current_iteration\"")!=
                 std::string::npos&&
-            metadata.find("\"format_version\": 7")!=std::string::npos&&
+            metadata.find("\"format_version\": 8")!=std::string::npos&&
             metadata.find("\"validity_policy\": \"relaxed_union\"")!=std::string::npos&&
             metadata.find("\"support_stability_checks\": 4")!=std::string::npos,
             "Nalivaiko mode must be recorded in metadata");
@@ -395,6 +409,17 @@ void test_return_mode() {
                             std::uint64_t{0})==1,
             "the returned initial state must seed the new WL histogram once");
     near(lowest.factor(),0.5,1e-14,"return mode factor halving");
+    require(lowest.return_count()==1,"count actual returns");
+    require(lowest.initialization_attempts()==0,"in-window reference needs no search attempts");
+    auto finishing_parameters=parameters;
+    finishing_parameters.final_factor=0.5;
+    wl::WangLandauWalker finishing(209,couplings,grid,{0,grid.bins()},finishing_parameters,17,excited,reference);
+    auto finishing_state=finishing.snapshot(); finishing_state.attempted=1; finishing.restore(finishing_state);
+    finishing.begin_next_iteration();
+    require(finishing.stage()==wl::RefinementStage::frozen && finishing.return_count()==0,
+            "freezing must not perform a return");
+    require(std::equal(finishing.spins().begin(),finishing.spins().end(),excited.begin()),
+            "freezing preserves the current configuration");
 
     const auto excited_bin=grid.index(wl::total_energy(*couplings,excited));
     require(excited_bin.has_value(),"excited state must lie on the test grid");
@@ -411,6 +436,9 @@ void test_return_mode() {
             "return mode must search from the reference state back into a higher window");
     require(upper_walker.attempted()==upper_attempted_before,
             "higher-window return search must not increment production attempts");
+    require(upper_walker.return_count()==1 && upper_walker.initialization_attempts()>0,
+            "higher-window return search has separate diagnostic attempts");
+    require(upper_walker.initialization_seconds()>=0.0,"initialization duration is nonnegative");
     const auto exact_fields=wl::local_fields(*couplings,upper_walker.spins());
     require(std::equal(upper_walker.fields().begin(),upper_walker.fields().end(),
                        exact_fields.begin()),"return-mode search must preserve local fields");
@@ -449,6 +477,99 @@ void test_return_mode() {
     require(joint_restored.energy_bin().has_value()&&
             joint_grid.index(joint_restored.energy(),joint_restored.order_parameter()).has_value(),
             "joint return mode must refresh the cached DOS cell after checkpoint restore");
+}
+
+void test_scoped_returns_and_diagnostics() {
+    int argc=1; char name[]="test"; char* args[]{name,nullptr}; char** argv=args;
+    wl::ParallelContext context(argc,argv);
+    const auto geometry=wl::Geometry::simple_cubic(2,1,1,1.0,{1,0,0},false);
+    auto couplings=std::make_shared<wl::DenseCouplings>(geometry,1.0);
+    wl::RunConfig c; c.grid={-2.5,3.5,1.0}; c.energy_grid_explicit=true;
+    c.windows=2; c.walkers_per_rank=2; c.overlap=0.5; c.seed=17;
+    c.max_attempts=100; c.exchange_interval_attempts=1;
+    c.wl={0.1,1,0.25,1}; c.wl.inverse_time_enabled=false;
+    c.wl.initialization_target_fraction=1.0;
+    c.wl.support_stability_checks=1; c.wl.return_mode=true; c.return_scope="lowest_window";
+    const auto result=wl::run_rewl(context,couplings,c);
+    require(result.converged && result.walker_statistics.size()==4,"scoped return run converges");
+    for(const auto& w:result.walker_statistics) {
+        require(w.returns_enabled==(w.window_id==0),"only the lowest window enables returns");
+        require((w.return_count>0)==(w.window_id==0),"only lowest-window walkers return");
+        require(w.stage==wl::RefinementStage::frozen,"stage recorded at convergence");
+        if(w.returns_enabled) near(w.return_reference_energy,-2,1e-14,"record return reference energy");
+        else require(std::isnan(w.return_reference_energy),"disabled returns have no reference energy");
+    }
+    require(result.exchange_statistics.size()==1 &&
+            result.exchange_statistics[0].attempted==result.exchange_attempted &&
+            result.exchange_statistics[0].accepted==result.exchange_accepted,
+            "boundary exchange counts match run totals");
+    c.return_scope="all_windows";
+    const auto legacy=wl::run_rewl(context,couplings,c);
+    require(std::all_of(legacy.walker_statistics.begin(),legacy.walker_statistics.end(),
+        [](const auto& w){return w.returns_enabled && w.return_count>0;}),"legacy all-window returns preserved");
+
+    wl::WlParameters parameters; parameters.support_stability_checks=1;
+    wl::WangLandauWalker walker(51,couplings,c.grid,{0,c.grid.bins()},parameters,123,{1,1});
+    auto state=walker.snapshot();
+    const auto extra=c.grid.index(2).value();
+    state.active[extra]=1; state.histogram[extra]=0; state.attempted=10;
+    walker.restore(state);
+    const auto d=wl::collect_walker_statistics(walker,0,0);
+    require(d.cumulative_active_bins==2 && d.cumulative_covered_bins==1 && d.covered_bins==1,
+            "diagnostics preserve the missing previously discovered cell");
+    near(d.coverage,0.5,1e-14,"diagnostic coverage");
+    require(wl::missing_histogram_cells(walker)==std::vector<std::size_t>{extra},"exact missing cell index");
+    require(walker.initialization_attempts()==0 && walker.return_count()==0 &&
+            walker.attempts_since_last_iteration()==0,"restore resets session diagnostics");
+
+    const auto path=std::filesystem::temp_directory_path()/"wl_missing_cells_test.csv";
+    const wl::DosGrid joint{{-1,1,1},wl::OrderParameterGrid{-1.5,1.5,1}};
+    const std::array missing{wl::MissingBin{2,51,0,joint.flatten(1,2)}};
+    wl::write_missing_bins_csv(path.string(),missing,joint);
+    std::ifstream input(path); std::string header,row; std::getline(input,header); std::getline(input,row);
+    require(row=="0,2,51,5,1,0.5,2,1","joint diagnostics map cells to E and Q correctly");
+    input.close(); std::filesystem::remove(path);
+}
+
+void test_openmp_walker_reproducibility() {
+#ifdef WL_HAS_OPENMP
+    struct RestoreThreads {
+        int count=omp_get_max_threads(), dynamic=omp_get_dynamic();
+        ~RestoreThreads() { omp_set_num_threads(count); omp_set_dynamic(dynamic); }
+    } restore_threads;
+    omp_set_dynamic(0); omp_set_num_threads(1);
+#endif
+    int argc=1; char name[]="test"; char* args[]{name,nullptr}; char** argv=args;
+    wl::ParallelContext context(argc,argv);
+    auto couplings=std::make_shared<wl::CsrCouplings>(
+        wl::Geometry::simple_cubic(4,4,1,1.0,{0,0,1},true),1.0,1.01);
+    wl::RunConfig c; c.grid={-34,34,4}; c.energy_grid_explicit=true;
+    c.windows=4; c.walkers_per_rank=2; c.seed=12345; c.max_attempts=2000;
+    c.exchange_interval_attempts=32; c.wl.check_interval_attempts=16; c.wl.support_stability_checks=1;
+    const auto reference=wl::run_rewl(context,couplings,c);
+    for(int threads:{2,4}) {
+#ifdef WL_HAS_OPENMP
+        omp_set_num_threads(threads);
+#else
+        (void)threads;
+#endif
+        const auto actual=wl::run_rewl(context,couplings,c);
+        require(reference.attempted==actual.attempted && reference.accepted==actual.accepted &&
+                reference.exchange_accepted==actual.exchange_accepted,"thread count preserves MC trajectory totals");
+        require(reference.fragments.size()==actual.fragments.size(),"thread count preserves windows");
+        for(std::size_t i=0;i<reference.fragments.size();++i) {
+            const auto& a=reference.fragments[i]; const auto& b=actual.fragments[i];
+            require(a.histogram==b.histogram && a.valid==b.valid,"thread count preserves histogram and support");
+            for(std::size_t k=0;k<a.log_g.size();++k)
+                require(a.log_g[k]==b.log_g[k] || (std::isnan(a.log_g[k])&&std::isnan(b.log_g[k])),
+                        "thread count preserves bitwise DOS");
+        }
+        for(std::size_t i=0;i<reference.walker_statistics.size();++i) {
+            const auto& a=reference.walker_statistics[i]; const auto& b=actual.walker_statistics[i];
+            require(a.energy==b.energy && a.factor==b.factor && a.stage==b.stage,
+                    "thread count preserves final walker state");
+        }
+    }
 }
 
 void test_unlimited_max_attempts() {
@@ -527,9 +648,10 @@ void test_unlimited_max_attempts() {
     std::string row;
     std::getline(stat_file,header);
     std::getline(stat_file,row);
-    require(header=="mpi_rank,window,walker_id,attempted_flips,attempted_mcs,accepted,forced_accepted,accepted_percent,attempts_since_last_accepted,mcs_since_last_accepted,energy,factor,active_bins,min_h,mean_h,min_over_mean,round_trips",
-            "walker statistics CSV header");
-    require(row=="0,0,0,5,2.5,0,0,0,5,2.5,1,1,1,6,6,1,0","walker statistics CSV row");
+    require(header.starts_with("mpi_rank,window,walker_id,attempted_flips,attempted_mcs,accepted,forced_accepted,accepted_percent,attempts_since_last_accepted,mcs_since_last_accepted,energy,factor,active_bins,min_h,mean_h,min_over_mean,round_trips,stage,covered_bins,coverage,"),
+            "walker statistics CSV legacy columns and coverage");
+    require(header.ends_with("returns_enabled,return_reference_energy,return_count"),"return statistics CSV columns");
+    require(row.starts_with("0,0,0,5,2.5,0,0,0,5,2.5,1,1,1,6,6,1,0,WL,1,1,"),"walker statistics CSV row");
     stat_file.close();
     std::filesystem::remove(stat_path);
 
@@ -1293,6 +1415,8 @@ int main() {
       {"forced_acceptance",test_forced_acceptance},
       {"refinement_transition",test_refinement_transition},
       {"return_mode",test_return_mode},
+      {"scoped_returns_diagnostics",test_scoped_returns_and_diagnostics},
+      {"openmp_reproducibility",test_openmp_walker_reproducibility},
       {"histogram_statistics",test_histogram_statistics},
       {"nalivaiko_refinement_mask",test_nalivaiko_refinement_mask},
       {"classic_rewl_independence_summary",test_classic_rewl_independence_and_summary},

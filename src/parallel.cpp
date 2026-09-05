@@ -1,9 +1,11 @@
 #include "wl/parallel.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <queue>
@@ -561,6 +563,26 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
 #endif
 
     std::vector<std::vector<std::unique_ptr<WangLandauWalker>>> groups(c.windows);
+    const auto save_failure_diagnostics=[&](const std::string& reason) {
+        // Separate names avoid mistaking a completed pilot's files for failed production.
+        const auto prefix=c.output_prefix+"_failure_rank_"+std::to_string(context.rank());
+        try {
+            std::ofstream failure(prefix+".log");
+            if(!failure) throw std::runtime_error("Cannot write "+prefix+".log");
+            failure<<reason<<'\n';
+            std::vector<WalkerStatistics> statistics;
+            std::vector<MissingBin> missing;
+            for(std::size_t w=first_window;w<last_window;++w) for(const auto& walker:groups[w]) {
+                statistics.push_back(collect_walker_statistics(*walker,w,context.rank()));
+                for(const auto cell:missing_histogram_cells(*walker))
+                    missing.push_back({static_cast<std::uint64_t>(w),walker->id(),context.rank(),cell});
+            }
+            write_workers_stat_csv(prefix+"_workers_stat.csv",statistics,couplings->size());
+            write_missing_bins_csv(prefix+"_workers_missing_bins.csv",missing,c.dos_grid());
+        } catch(const std::exception& error) {
+            std::cerr<<"warning: could not save failure diagnostics: "<<error.what()<<'\n';
+        }
+    };
     std::string initialization_error;
     std::size_t initialization_window=first_window,initialization_walker=0;
     try {
@@ -574,8 +596,11 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 std::vector<std::int8_t> initial_spins;
                 if(!c.initial_spins_by_walker.empty())
                     initial_spins=c.initial_spins_by_walker[static_cast<std::size_t>(global_id)];
+                auto walker_parameters=c.wl;
+                walker_parameters.return_mode=c.wl.return_mode &&
+                    (c.return_scope=="all_windows" || w==0);
                 group.push_back(std::make_unique<WangLandauWalker>(
-                    global_id,couplings,c.dos_grid(),windows[w],c.wl,c.seed,
+                    global_id,couplings,c.dos_grid(),windows[w],walker_parameters,c.seed,
                     c.order_parameter,std::move(initial_spins),return_spins));
             }
         }
@@ -604,13 +629,16 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
             MPI_Bcast(shared_error.data(),message_length,MPI_CHAR,failure_rank,MPI_COMM_WORLD);
             if(leader_comm!=MPI_COMM_NULL) MPI_Comm_free(&leader_comm);
             if(window_comm!=MPI_COMM_NULL) MPI_Comm_free(&window_comm);
+            save_failure_diagnostics(shared_error);
             throw std::runtime_error("MPI walker initialization failed on rank "+
                                      std::to_string(failure_rank)+": "+shared_error);
         }
     }
 #endif
-    if(!initialization_error.empty())
+    if(!initialization_error.empty()) {
+        save_failure_diagnostics(initialization_error);
         throw std::runtime_error("Walker initialization failed: "+initialization_error);
+    }
 
     if(!c.checkpoint_path.empty() && c.windows==1 && c.walkers_per_rank==1) {
         try {
@@ -626,16 +654,20 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
     }
 
     RewlResult result;
+    result.exchange_statistics.resize(c.windows-1);
+    std::vector<WangLandauWalker*> local_walkers;
+    for(std::size_t w=first_window;w<last_window;++w)
+        for(auto& walker:groups[w]) local_walkers.push_back(walker.get());
+    if(local_walkers.size()>static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()))
+        throw std::overflow_error("Too many local walkers for OpenMP loop");
     std::uint64_t epoch=0,last_checkpoint=0;
 #ifdef WL_HAS_MPI
     std::vector<std::int8_t> remote_exchange_spins(distributed?couplings->size():0);
     std::vector<double> remote_exchange_fields(distributed?couplings->size():0);
 #endif
     std::vector<std::vector<std::uint64_t>> last_flatness_check(c.windows);
-    std::vector<std::vector<double>> last_flatness(c.windows);
     for(std::size_t w=first_window;w<last_window;++w) {
         last_flatness_check[w].assign(groups[w].size(),0);
-        last_flatness[w].assign(groups[w].size(),0.0);
     }
     const auto progress_period=std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<double>(c.progress_interval_seconds));
@@ -646,19 +678,20 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
     while(!globally_done) {
         bool limit_reached=!unlimited_attempts;
         std::string return_error;
+        // Independent RNG/state per walker; exchanges and MPI remain on the master thread.
+        #pragma omp parallel for schedule(static)
+        for(std::int64_t li=0;li<static_cast<std::int64_t>(local_walkers.size());++li) {
+            auto& walker=*local_walkers[static_cast<std::size_t>(li)];
+            auto batch=c.exchange_interval_attempts;
+            if(!unlimited_attempts) {
+                const auto remaining=walker.attempted()<c.max_attempts?
+                    c.max_attempts-walker.attempted():0;
+                batch=std::min(batch,remaining);
+            }
+            walker.run_attempts(batch);
+        }
         for(std::size_t w=first_window;w<last_window;++w) {
             auto& group=groups[w];
-            #pragma omp parallel for schedule(static)
-            for(std::int64_t li=0;li<static_cast<std::int64_t>(group.size());++li) {
-                auto& walker=*group[static_cast<std::size_t>(li)];
-                auto batch=c.exchange_interval_attempts;
-                if(!unlimited_attempts) {
-                    const auto remaining=walker.attempted()<c.max_attempts?
-                        c.max_attempts-walker.attempted():0;
-                    batch=std::min(batch,remaining);
-                }
-                walker.run_attempts(batch);
-            }
             if(!unlimited_attempts)
                 for(const auto& walker:group)
                     if(walker->attempted()<c.max_attempts) limit_reached=false;
@@ -671,9 +704,6 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 const bool at_limit=!unlimited_attempts&&attempted>=c.max_attempts;
                 if(attempted-last_flatness_check[w][local]<check_interval&&!at_limit) continue;
                 last_flatness_check[w][local]=attempted;
-                const auto histogram=walker.histogram_statistics();
-                last_flatness[w][local]=c.wl.inverse_time_enabled?
-                    histogram.coverage:histogram.min_over_mean;
                 if(walker.ready_for_iteration()) {
                     if(!c.wl.return_mode) {
                         walker.begin_next_iteration();
@@ -707,13 +737,16 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 MPI_Bcast(shared_error.data(),message_length,MPI_CHAR,failure_rank,MPI_COMM_WORLD);
                 if(leader_comm!=MPI_COMM_NULL) MPI_Comm_free(&leader_comm);
                 if(window_comm!=MPI_COMM_NULL) MPI_Comm_free(&window_comm);
+                save_failure_diagnostics(shared_error);
                 throw std::runtime_error("MPI return-mode initialization failed on rank "+
                                          std::to_string(failure_rank)+": "+shared_error);
             }
         }
 #endif
-        if(c.wl.return_mode&&!return_error.empty())
+        if(c.wl.return_mode&&!return_error.empty()) {
+            save_failure_diagnostics(return_error);
             throw std::runtime_error("Return-mode initialization failed: "+return_error);
+        }
 
         const auto parity=epoch%2;
         if(!distributed) {
@@ -722,8 +755,11 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 const auto pairs=std::min(left.size(),right.size());
                 for(std::size_t p=0;p<pairs;++p) {
                     ++result.exchange_attempted;
-                    if(local_exchange(*left[p],*right[(p+epoch)%pairs],c.seed,epoch,boundary))
+                    ++result.exchange_statistics[boundary].attempted;
+                    if(local_exchange(*left[p],*right[(p+epoch)%pairs],c.seed,epoch,boundary)) {
                         ++result.exchange_accepted;
+                        ++result.exchange_statistics[boundary].accepted;
+                    }
                 }
             }
         }
@@ -759,6 +795,7 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 const bool accept=std::isfinite(logp)&&(logp>=0.0||
                     std::log(std::max(exchange_rng.uniform(),0x1.0p-53))<logp);
                 ++result.exchange_attempted;
+                ++result.exchange_statistics[boundary].attempted;
                 if(accept) {
                     const auto own_spins=walker.spins();
                     const auto own_fields=walker.fields();
@@ -770,6 +807,7 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                                                        remote_exchange_fields,other_energy,
                                                        other_order_parameter);
                     ++result.exchange_accepted;
+                    ++result.exchange_statistics[boundary].accepted;
                 }
             }
         }
@@ -786,6 +824,11 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                 double local_progress_factor=0.0;
                 double local_progress_flatness=1.0;
                 std::uint64_t local_stage_counts[3]{};
+                std::uint64_t local_search_attempts=0;
+                double local_search_seconds=0.0;
+                const WangLandauWalker* diagnostic_walker=nullptr;
+                std::size_t diagnostic_window=0;
+                double diagnostic_coverage=std::numeric_limits<double>::infinity();
                 for(std::size_t w=first_window;w<last_window;++w) {
                     const auto& group=groups[w];
                     local_progress_attempted=std::max(local_progress_attempted,group.front()->attempted());
@@ -795,14 +838,26 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                         const auto stage=walker->stage();
                         ++local_stage_counts[stage==RefinementStage::wang_landau?0:
                                              stage==RefinementStage::inverse_time?1:2];
-                        if(stage==RefinementStage::wang_landau)
-                            local_progress_flatness=std::min(local_progress_flatness,
-                                                            last_flatness[w][local]);
+                        local_search_attempts+=walker->initialization_attempts();
+                        local_search_seconds+=walker->initialization_seconds();
+                        if(stage==RefinementStage::wang_landau) {
+                            const auto h=walker->histogram_statistics();
+                            const auto criterion=c.wl.inverse_time_enabled?h.coverage:h.min_over_mean;
+                            local_progress_flatness=std::min(local_progress_flatness,criterion);
+                            if(!diagnostic_walker || criterion<diagnostic_coverage ||
+                               (criterion==diagnostic_coverage && walker->attempts_since_last_iteration()>
+                                                                   diagnostic_walker->attempts_since_last_iteration())) {
+                                diagnostic_walker=walker.get(); diagnostic_window=w;
+                                diagnostic_coverage=criterion;
+                            }
+                        }
                     }
                 }
                 auto progress_attempted=local_progress_attempted;
                 auto progress_factor=local_progress_factor;
                 auto progress_flatness=local_progress_flatness;
+                auto search_attempts=local_search_attempts;
+                auto search_seconds=local_search_seconds;
                 std::uint64_t stage_counts[3]{local_stage_counts[0],local_stage_counts[1],
                                               local_stage_counts[2]};
 #ifdef WL_HAS_MPI
@@ -811,10 +866,39 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                                MPI_COMM_WORLD);
                     MPI_Reduce(&local_progress_factor,&progress_factor,1,MPI_DOUBLE,MPI_MAX,0,
                                MPI_COMM_WORLD);
-                    MPI_Reduce(&local_progress_flatness,&progress_flatness,1,MPI_DOUBLE,MPI_MIN,0,
-                               MPI_COMM_WORLD);
+                    MPI_Allreduce(&local_progress_flatness,&progress_flatness,1,MPI_DOUBLE,MPI_MIN,
+                                  MPI_COMM_WORLD);
+                    MPI_Reduce(&local_search_attempts,&search_attempts,1,MPI_UINT64_T,MPI_SUM,0,MPI_COMM_WORLD);
+                    MPI_Reduce(&local_search_seconds,&search_seconds,1,MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
                     MPI_Reduce(local_stage_counts,stage_counts,3,MPI_UINT64_T,MPI_SUM,0,
                                MPI_COMM_WORLD);
+                }
+#endif
+                // Select one worst WL walker globally; MPI remains outside OpenMP regions.
+                int diagnostic_owner=diagnostic_walker?context.rank():context.size();
+#ifdef WL_HAS_MPI
+                if(distributed) {
+                    const int candidate=diagnostic_walker && diagnostic_coverage==progress_flatness?
+                        context.rank():context.size();
+                    MPI_Allreduce(&candidate,&diagnostic_owner,1,MPI_INT,MPI_MIN,MPI_COMM_WORLD);
+                }
+#endif
+                std::array<std::uint64_t,15> detail{};
+                std::array<double,3> detail_values{};
+                if(diagnostic_owner<context.size() && context.rank()==diagnostic_owner) {
+                    const auto d=collect_walker_statistics(*diagnostic_walker,diagnostic_window,context.rank());
+                    const auto missing=missing_histogram_cells(*diagnostic_walker);
+                    detail[0]=d.window_id; detail[1]=d.walker_id;
+                    detail[2]=d.cumulative_covered_bins; detail[3]=d.cumulative_active_bins;
+                    detail[4]=d.attempts_since_last_iteration; detail[5]=missing.size();
+                    detail[6]=std::min<std::size_t>(missing.size(),8);
+                    for(std::size_t i=0;i<detail[6];++i) detail[7+i]=missing[i];
+                    detail_values={d.factor,d.seconds_since_last_iteration,d.energy};
+                }
+#ifdef WL_HAS_MPI
+                if(distributed && diagnostic_owner<context.size()) {
+                    MPI_Bcast(detail.data(),static_cast<int>(detail.size()),MPI_UINT64_T,diagnostic_owner,MPI_COMM_WORLD);
+                    MPI_Bcast(detail_values.data(),static_cast<int>(detail_values.size()),MPI_DOUBLE,diagnostic_owner,MPI_COMM_WORLD);
                 }
 #endif
                 if(context.rank()==0) {
@@ -824,7 +908,23 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                         <<" attempted_flips_per_walker="<<progress_attempted
                         <<(c.wl.inverse_time_enabled?" coverage=":" flatness=")
                         <<progress_flatness<<" factor="<<progress_factor
-                        <<" stages="<<stage_counts[0]<<'/'<<stage_counts[1]<<'/'<<stage_counts[2];
+                        <<" stages="<<stage_counts[0]<<'/'<<stage_counts[1]<<'/'<<stage_counts[2]
+                        <<" search_attempts="<<search_attempts<<" search_worker_seconds="<<search_seconds;
+                    if(diagnostic_owner<context.size()) {
+                        line<<" slowest_rank="<<diagnostic_owner<<" window="<<detail[0]<<" walker="<<detail[1]
+                            <<" covered="<<detail[2]<<'/'<<detail[3]<<" walker_factor="<<detail_values[0]
+                            <<" waiting_mcs="<<static_cast<double>(detail[4])/static_cast<double>(couplings->size())
+                            <<" waiting_seconds="<<detail_values[1]<<" energy="<<detail_values[2]
+                            <<(c.dos_grid().joint()?" missing_EQ=[":" missing_energy_centers=[");
+                        for(std::size_t i=0;i<detail[6];++i) {
+                            if(i) line<<';';
+                            const auto cell=static_cast<std::size_t>(detail[7+i]);
+                            line<<c.grid.center(c.dos_grid().energy_bin(cell));
+                            if(c.dos_grid().joint()) line<<':'<<c.dos_grid().order_parameter->center(c.dos_grid().q_bin(cell));
+                        }
+                        if(detail[5]>detail[6]) line<<";...";
+                        line<<"] missing_count="<<detail[5];
+                    }
                     const auto text=line.str();
                     std::cout<<'\r'<<text;
                     if(progress_line_width>text.size())
@@ -859,14 +959,9 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
             local_attempted+=walker->attempted(); local_accepted+=walker->accepted();
             local_forced_accepted+=walker->forced_accepted();
             local_converged&=walker->stage()==RefinementStage::frozen;
-            const auto last_accepted=walker->last_accepted_attempt();
-            const auto histogram=walker->histogram_statistics();
-            result.walker_statistics.push_back({
-                walker->id(),static_cast<std::uint64_t>(w),context.rank(),
-                walker->attempted(),walker->accepted(),walker->forced_accepted(),
-                walker->attempted()-last_accepted,walker->energy(),
-                walker->factor(),histogram.active_bins,histogram.minimum,
-                histogram.mean,histogram.min_over_mean,walker->round_trips()});
+            result.walker_statistics.push_back(collect_walker_statistics(*walker,w,context.rank()));
+            for(const auto cell:missing_histogram_cells(*walker))
+                result.missing_bins.push_back({static_cast<std::uint64_t>(w),walker->id(),context.rank(),cell});
             if(c.wl.collect_window_statistics)
                 for(const auto& representative:walker->representatives())
                     if(!representative.spins.empty())
@@ -925,8 +1020,8 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                           MPI_INT32_T,0,leader_comm);
         }
         const auto local_stat_count=result.walker_statistics.size();
-        constexpr std::size_t statistic_integer_fields=10;
-        constexpr std::size_t statistic_double_fields=4;
+        constexpr std::size_t statistic_integer_fields=19;
+        constexpr std::size_t statistic_double_fields=8;
         std::vector<std::uint64_t> local_stat_integers(local_stat_count*statistic_integer_fields);
         std::vector<double> local_stat_doubles(local_stat_count*statistic_double_fields);
         for(std::size_t i=0;i<local_stat_count;++i) {
@@ -947,6 +1042,19 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
             local_stat_doubles[double_offset+1]=statistic.factor;
             local_stat_doubles[double_offset+2]=statistic.mean_histogram;
             local_stat_doubles[double_offset+3]=statistic.min_over_mean;
+            local_stat_integers[integer_offset+10]=static_cast<std::uint64_t>(statistic.stage);
+            local_stat_integers[integer_offset+11]=statistic.covered_bins;
+            local_stat_integers[integer_offset+12]=statistic.cumulative_active_bins;
+            local_stat_integers[integer_offset+13]=statistic.cumulative_covered_bins;
+            local_stat_integers[integer_offset+14]=statistic.attempts_since_last_iteration;
+            local_stat_integers[integer_offset+15]=statistic.initialization_attempts;
+            local_stat_integers[integer_offset+16]=statistic.initialization_restarts;
+            local_stat_integers[integer_offset+17]=statistic.returns_enabled;
+            local_stat_integers[integer_offset+18]=statistic.return_count;
+            local_stat_doubles[double_offset+4]=statistic.coverage;
+            local_stat_doubles[double_offset+5]=statistic.seconds_since_last_iteration;
+            local_stat_doubles[double_offset+6]=statistic.initialization_seconds;
+            local_stat_doubles[double_offset+7]=statistic.return_reference_energy;
         }
         std::vector<std::uint64_t> all_stat_integers;
         std::vector<double> all_stat_doubles;
@@ -954,6 +1062,26 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                       local_stat_integers.size(),MPI_UINT64_T,0,MPI_COMM_WORLD);
         gather_chunks(local_stat_doubles.data(),all_stat_doubles,
                       local_stat_doubles.size(),MPI_DOUBLE,0,MPI_COMM_WORLD);
+        std::vector<std::uint64_t> local_missing,all_missing;
+        for(const auto& m:result.missing_bins) {
+            local_missing.insert(local_missing.end(),{m.window_id,m.walker_id,
+                static_cast<std::uint64_t>(m.mpi_rank),static_cast<std::uint64_t>(m.cell)});
+        }
+        (void)gather_variable_chunks(local_missing.data(),local_missing.size(),all_missing,
+                                    MPI_UINT64_T,0,203,MPI_COMM_WORLD);
+        result.missing_bins.clear();
+        if(context.rank()==0) for(std::size_t i=0;i<all_missing.size();i+=4)
+            result.missing_bins.push_back({all_missing[i],all_missing[i+1],
+                static_cast<int>(all_missing[i+2]),static_cast<std::size_t>(all_missing[i+3])});
+        std::vector<std::uint64_t> local_exchanges(2*result.exchange_statistics.size()),all_exchanges(local_exchanges.size());
+        for(std::size_t b=0;b<result.exchange_statistics.size();++b) {
+            local_exchanges[2*b]=result.exchange_statistics[b].attempted;
+            local_exchanges[2*b+1]=result.exchange_statistics[b].accepted;
+        }
+        reduce_chunks(local_exchanges.data(),all_exchanges.data(),local_exchanges.size(),
+                      MPI_UINT64_T,MPI_SUM,0,MPI_COMM_WORLD);
+        if(context.rank()==0) for(std::size_t b=0;b<result.exchange_statistics.size();++b)
+            result.exchange_statistics[b]={all_exchanges[2*b]/2,all_exchanges[2*b+1]/2};
         result.fragments.clear();
         std::vector<double> all_displacement;
         std::vector<std::uint64_t> all_displacement_samples;
@@ -1023,7 +1151,15 @@ RewlResult run_rewl(const ParallelContext& context, std::shared_ptr<const Coupli
                     all_stat_doubles[double_offset+1],
                     static_cast<std::size_t>(all_stat_integers[integer_offset+7]),
                     all_stat_integers[integer_offset+8],all_stat_doubles[double_offset+2],
-                    all_stat_doubles[double_offset+3],all_stat_integers[integer_offset+9]});
+                    all_stat_doubles[double_offset+3],all_stat_integers[integer_offset+9],
+                    static_cast<RefinementStage>(all_stat_integers[integer_offset+10]),
+                    static_cast<std::size_t>(all_stat_integers[integer_offset+11]),all_stat_doubles[double_offset+4],
+                    static_cast<std::size_t>(all_stat_integers[integer_offset+12]),
+                    static_cast<std::size_t>(all_stat_integers[integer_offset+13]),
+                    all_stat_integers[integer_offset+14],all_stat_doubles[double_offset+5],
+                    all_stat_integers[integer_offset+15],all_stat_integers[integer_offset+16],
+                    all_stat_doubles[double_offset+6],all_stat_integers[integer_offset+17]!=0,
+                    all_stat_doubles[double_offset+7],all_stat_integers[integer_offset+18]});
             }
             for(std::size_t w=0;w<c.windows;++w) {
                 const auto dos_offset=w*cells;

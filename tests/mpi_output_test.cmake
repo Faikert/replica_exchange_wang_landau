@@ -6,7 +6,9 @@ endif()
 
 set(expected_files
   "${PREFIX}_metadata.json"
-  "${PREFIX}_workers_stat.csv")
+  "${PREFIX}_workers_stat.csv"
+  "${PREFIX}_workers_missing_bins.csv"
+  "${PREFIX}_exchange_stat.csv")
 if(NOT DEFINED JOINT)
   set(JOINT TRUE)
 endif()

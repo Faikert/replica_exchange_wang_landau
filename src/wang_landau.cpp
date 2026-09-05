@@ -277,9 +277,16 @@ WangLandauWalker::WangLandauWalker(std::uint64_t walker_id,
     }
 
     initialize_in_window(supplied_initial_configuration);
+    last_iteration_attempt_=attempted_;
+    last_iteration_time_=std::chrono::steady_clock::now();
 }
 
 void WangLandauWalker::initialize_in_window(bool supplied_initial_configuration) {
+    struct SearchTimer {
+        double& total;
+        std::chrono::steady_clock::time_point start{std::chrono::steady_clock::now()};
+        ~SearchTimer() { total += std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count(); }
+    } timer{initialization_seconds_};
 
     // An explicitly supplied in-window configuration is authoritative. Otherwise sample
     // pi(E) proportional to exp(-abs(E-E_target)/T_search). Raise T_search after stalls
@@ -356,6 +363,7 @@ void WangLandauWalker::initialize_in_window(bool supplied_initial_configuration)
                 record_reached_energy(energy_);
                 search_temperature=initial_search_temperature;
                 ++random_restarts;
+                ++initialization_restarts_;
             }
             attempts_since_improvement=0;
             if(inside_target_band(energy_)) {
@@ -363,6 +371,7 @@ void WangLandauWalker::initialize_in_window(bool supplied_initial_configuration)
             }
         }
         const auto i = static_cast<std::size_t>(rng_.bounded(spins_.size()));
+        ++initialization_attempts_;
         const auto old = spins_[i];
         const auto delta = flip_delta(i, spins_, fields_);
         const auto q_delta=order_parameter_?order_parameter_->flip_delta(i,old):0.0;
@@ -404,7 +413,9 @@ void WangLandauWalker::initialize_in_window(bool supplied_initial_configuration)
            <<"; adaptive search used "<<temperature_increases
            <<" temperature increases up to "<<highest_search_temperature
            <<" and "<<random_restarts<<" random restarts"
-           <<" (stall interval "<<stall_attempts<<" attempts)";
+           <<" (stall interval "<<stall_attempts<<" attempts)"
+           <<"; initialization_seconds="
+           <<std::chrono::duration<double>(std::chrono::steady_clock::now()-timer.start).count();
     throw std::runtime_error(message.str());
 }
 
@@ -608,6 +619,8 @@ void WangLandauWalker::begin_next_iteration() {
     if(!ready_for_iteration())
         throw std::logic_error("WL iteration is not complete");
     factor_ *= 0.5;
+    last_iteration_attempt_=attempted_;
+    last_iteration_time_=std::chrono::steady_clock::now();
     for(const auto cell:iteration_cells_) histogram_[cell]=0;
     iteration_cells_.clear();
     histogram_sum_=0;
@@ -621,7 +634,7 @@ void WangLandauWalker::begin_next_iteration() {
         }
     }
     freeze_if_finished();
-    if(parameters_.return_mode) return_to_reference_configuration();
+    if(parameters_.return_mode && stage_!=RefinementStage::frozen) return_to_reference_configuration();
 }
 
 void WangLandauWalker::return_to_reference_configuration() {
@@ -634,6 +647,7 @@ void WangLandauWalker::return_to_reference_configuration() {
     current_location_valid_=false;
     round_trip_state_=0;
     initialize_in_window(true);
+    ++return_count_;
 }
 
 void WangLandauWalker::freeze_if_finished() {
@@ -755,6 +769,10 @@ void WangLandauWalker::restore(const WalkerSnapshot& s) {
     active_histogram_sum_=active_histogram_sum;
     forced_accepted_ = s.forced_accepted; last_accepted_attempt_ = s.last_accepted_attempt;
     last_new_cell_attempt_=s.last_new_cell_attempt; stage_ = s.stage;
+    return_count_=initialization_attempts_=initialization_restarts_=0;
+    initialization_seconds_=0.0;
+    last_iteration_attempt_=attempted_;
+    last_iteration_time_=std::chrono::steady_clock::now();
     set_current_location(*state_location);
     rng_.set_state(s.rng_state);
     if(parameters_.collect_window_statistics) {

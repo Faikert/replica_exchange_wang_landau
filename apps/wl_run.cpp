@@ -65,6 +65,7 @@ int main(int argc,char** argv) {
                      <<" force_accept_after_mcs="<<config.force_accept_after_mcs
                      <<" inverse_time="<<(config.wl.inverse_time_enabled?"yes":"no")
                      <<" return_mode="<<(config.wl.return_mode?"yes":"no")
+                     <<" return_scope="<<config.return_scope
                      <<" initialization_max_attempts="<<config.wl.initialization_max_attempts
                      <<" initialization_target_fraction="<<config.wl.initialization_target_fraction
                      <<" initialization_temperature_fraction="
@@ -251,11 +252,12 @@ int main(int argc,char** argv) {
                                     result.attempted,result.accepted,result.forced_accepted,
                                     result.exchange_attempted,result.exchange_accepted,
                                     result.converged,parallel.size(),wl::maximum_openmp_threads(),
-                                    postprocessing_status,result.fragments,support_components);
-            const bool no_global_dos=config.order_parameter?!joint:!dos;
-            if(!result.converged||no_global_dos)
-                wl::write_workers_stat_csv(config.output_prefix+"_workers_stat.csv",
-                                           result.walker_statistics,geometry.size());
+                                    postprocessing_status,result.fragments,support_components,result.walker_statistics);
+            wl::write_workers_stat_csv(config.output_prefix+"_workers_stat.csv",
+                                       result.walker_statistics,geometry.size());
+            wl::write_missing_bins_csv(config.output_prefix+"_workers_missing_bins.csv",
+                                      result.missing_bins,config.dos_grid());
+            wl::write_exchange_stat_csv(config.output_prefix+"_exchange_stat.csv",result.exchange_statistics);
 
             if(config.order_parameter) {
                 for(std::size_t i=0;i<result.fragments.size();++i)

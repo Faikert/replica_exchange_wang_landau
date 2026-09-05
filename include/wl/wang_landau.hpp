@@ -4,6 +4,7 @@
 #include "wl/rng.hpp"
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -193,6 +194,19 @@ public:
     [[nodiscard]] std::uint64_t last_accepted_attempt() const noexcept {
         return last_accepted_attempt_;
     }
+    // Diagnostics are session-local; checkpoint restore resets these counters.
+    [[nodiscard]] bool returns_enabled() const noexcept { return parameters_.return_mode; }
+    [[nodiscard]] double return_reference_energy() const noexcept { return return_energy_; }
+    [[nodiscard]] std::uint64_t return_count() const noexcept { return return_count_; }
+    [[nodiscard]] std::uint64_t initialization_attempts() const noexcept { return initialization_attempts_; }
+    [[nodiscard]] std::uint64_t initialization_restarts() const noexcept { return initialization_restarts_; }
+    [[nodiscard]] double initialization_seconds() const noexcept { return initialization_seconds_; }
+    [[nodiscard]] std::uint64_t attempts_since_last_iteration() const noexcept {
+        return attempted_ - last_iteration_attempt_;
+    }
+    [[nodiscard]] double seconds_since_last_iteration() const noexcept {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now()-last_iteration_time_).count();
+    }
     [[nodiscard]] std::span<const std::int8_t> spins() const noexcept { return spins_; }
     [[nodiscard]] std::span<const double> fields() const noexcept { return fields_; }
 
@@ -222,6 +236,12 @@ private:
     std::vector<double> return_fields_;
     double return_energy_{};
     double return_order_parameter_{};
+    std::uint64_t return_count_{};
+    std::uint64_t initialization_attempts_{};
+    std::uint64_t initialization_restarts_{};
+    double initialization_seconds_{};
+    std::uint64_t last_iteration_attempt_{};
+    std::chrono::steady_clock::time_point last_iteration_time_{std::chrono::steady_clock::now()};
     std::vector<double> log_g_;
     std::vector<std::uint64_t> histogram_;
     std::vector<std::uint8_t> active_;

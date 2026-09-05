@@ -3,6 +3,7 @@
 #include "wl/analysis.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -34,6 +35,7 @@ struct RunConfig {
     std::uint64_t seed{1};
     bool seed_explicit{false};
     WlParameters wl;
+    std::string return_scope{"all_windows"};
     std::uint64_t exchange_interval_attempts{1000};
     std::uint64_t max_attempts{10'000'000};
     std::uint64_t checkpoint_interval_attempts{1'000'000};
@@ -78,7 +80,35 @@ struct WalkerStatistics {
     double mean_histogram{};
     double min_over_mean{};
     std::uint64_t round_trips{};
+    RefinementStage stage{RefinementStage::wang_landau};
+    std::size_t covered_bins{};
+    double coverage{};
+    std::size_t cumulative_active_bins{};
+    std::size_t cumulative_covered_bins{};
+    std::uint64_t attempts_since_last_iteration{};
+    double seconds_since_last_iteration{};
+    std::uint64_t initialization_attempts{};
+    std::uint64_t initialization_restarts{};
+    double initialization_seconds{};
+    bool returns_enabled{};
+    double return_reference_energy{std::numeric_limits<double>::quiet_NaN()};
+    std::uint64_t return_count{};
 };
+
+struct MissingBin {
+    std::uint64_t window_id{}, walker_id{};
+    int mpi_rank{};
+    std::size_t cell{};
+};
+struct ExchangeStatistics {
+    std::uint64_t attempted{}, accepted{};
+};
+[[nodiscard]] WalkerStatistics collect_walker_statistics(
+    const WangLandauWalker& walker, std::size_t window, int mpi_rank);
+[[nodiscard]] std::vector<std::size_t> missing_histogram_cells(const WangLandauWalker& walker);
+[[nodiscard]] const char* stage_name(RefinementStage stage) noexcept;
+void write_missing_bins_csv(const std::string& path, std::span<const MissingBin> bins, DosGrid grid);
+void write_exchange_stat_csv(const std::string& path, std::span<const ExchangeStatistics> statistics);
 
 [[nodiscard]] RunConfig parse_arguments(int argc, char** argv);
 [[nodiscard]] std::string usage(std::string_view program);
@@ -104,7 +134,8 @@ void write_metadata_json(const std::string& path, const RunConfig& config,
                          int openmp_threads,
                          std::string_view postprocessing_status = "complete",
                          std::span<const DosFragment> fragments = {},
-                         std::size_t support_components = 0);
+                         std::size_t support_components = 0,
+                         std::span<const WalkerStatistics> walkers = {});
 void save_checkpoint(const std::string& path, const WalkerSnapshot& snapshot);
 [[nodiscard]] WalkerSnapshot load_checkpoint(const std::string& path);
 

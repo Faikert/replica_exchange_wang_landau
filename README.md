@@ -42,6 +42,53 @@ If `seed` is omitted from both the INI file and the command line, MPI rank 0 gen
 
 See `examples/system.csv` and `examples/run.ini` for the supported sections and keys.
 
+### Square-lattice antiferromagnetic Ising reference
+
+`examples/square_afm_4x4.csv` and `examples/square_afm_4x4.ini` define the ordinary
+nearest-neighbor 2D Ising antiferromagnet on a periodic 4x4 square lattice with unit
+spacing and `J=1`. All easy axes point along z, perpendicular to the lattice.
+With `cutoff=1.01`, the dipolar kernel gives exactly `J_ij=+1` for the four nearest
+neighbors and zero for every other pair. Thus `E=+sum_<ij> sigma_i*sigma_j`;
+antiparallel neighbors minimize the energy. The cutoff is essential to this model.
+
+There are 16 spins and 32 bonds. The two checkerboard ground states have `E=-32`,
+and the two fully aligned states have `E=+32`. The INI uses bin edges `[-34,34]`
+with width 4 so the centers coincide with the discrete energy levels. Not every
+bin is accessible (in particular, `E=+/-28` is absent). Although the physical range
+is complete, `complete_range=false` is necessary because the current exporter
+requires every grid bin to be visited for absolute normalization. The sampled DOS
+is relative (`max(log_g)=0`); energy, heat capacity and other observables independent
+of the DOS normalization remain usable. Absolute entropy and free energy require
+normalization to `2^16` states first.
+
+Run four overlapping REWL windows with two walkers each, or enumerate all 65,536
+configurations for a finite-size reference:
+
+```powershell
+build/Release/wl_run.exe --config examples/square_afm_4x4.ini
+build/Release/wl_exact.exe --config examples/square_afm_4x4.ini --output square_afm_4x4_reference
+```
+
+Compare the sampled `square_afm_4x4_dos.csv` with
+`square_afm_4x4_reference_exact.csv`: omit exact rows with `log_g=-inf` and subtract
+the maximum exact `log_g` before comparing with the relative sampled DOS.
+The INI selects traditional WL refinement and a fixed seed; check `converged=yes`
+before treating a capped run as converged. For MPI, prepend `mpiexec -n 4` to
+the `wl_run` command. A single-walker WL comparison uses the same INI with
+`--windows 1 --walkers 1 --output square_afm_4x4_single`.
+
+For a larger system, `examples/square_afm_32x32.csv` and
+`examples/square_afm_32x32.ini` provide the same model on a periodic 32x32 lattice:
+1024 spins, 2048 bonds, and physical energies from -2048 to +2048. Bin edges are
+[-2050,2050] with width 4. The INI retains four windows, two walkers per window,
+and relative DOS normalization because the levels +/-2044 are inaccessible.
+A finite work limit does not guarantee convergence; increase `--max-mcs` if needed.
+Exact enumeration of this size is impractical; use the 4x4 example above for it.
+
+```powershell
+build/Release/wl_run.exe --config examples/square_afm_32x32.ini
+```
+
 ### Joint density of states g(E,Q)
 
 Set `[order_parameter] mode = weighted_sum` to sample the signed joint DOS for
@@ -84,7 +131,7 @@ User-facing work intervals are expressed in Monte Carlo sweeps (MCS): one MCS is
 
 Exact attempted-flip counts are still stored because histogram updates, checkpoint restart, and the internal `1/t` refinement use one update per proposal. Metadata and runtime output contain both MCS and resolved flip-attempt counts.
 
-Use `--progress 2` or `[run] progress = 2` to refresh a single console line approximately every two seconds; `progress = 0` disables it. With `inverse_time=true`, the line reports the minimum current-stage coverage of each walker's cumulative discovered energy support; traditional WL runs report histogram flatness instead. It also contains MCS, exact attempted flips per walker, the largest current modification factor, and `WL/1t/frozen` walker counts. The timer is checked between exchange batches, so a long `exchange_interval_mcs` can delay an update. MPI mode aggregates the values and only rank 0 writes the line.
+Use `--progress 2` or `[run] progress = 2` to refresh a single console line approximately every two seconds; `progress = 0` disables it. With `inverse_time=true`, the line reports the minimum current-stage coverage; traditional WL runs report histogram flatness. It also contains MCS, the largest modification factor, `WL/1t/frozen` counts, cumulative initialization work, and the slowest WL walker with its window, coverage, factor, time since its last refinement step, current energy, and up to eight missing energy or `(E,Q)` cells. The timer is checked between exchange batches, so a long `exchange_interval_mcs` can delay an update. MPI aggregates the values and rank 0 prints the selected global slowest walker.
 
 ```powershell
 build/Release/wl_run.exe --nx 2 --ny 2 --nz 2 `
@@ -93,6 +140,8 @@ build/Release/wl_run.exe --nx 2 --ny 2 --nz 2 `
 ```
 
 For MPI, the number of ranks must be a multiple of `--windows`. Each rank owns `--walkers` OpenMP walkers. Ranks belonging to one window use an MPI subcommunicator for DOS averaging; corresponding ranks in adjacent windows exchange replicas using an even/odd schedule. MPI calls are made by the master thread under `MPI_THREAD_FUNNELED`.
+
+Without MPI, all walkers from all energy windows share one OpenMP loop. Set `OMP_NUM_THREADS` to the available CPU cores, up to the total number of local walkers. Walker state and RNG streams remain independent, and exchanges still occur after each parallel batch; fixed seeds therefore retain the same trajectories across OpenMP thread counts.
 
 ### Adaptive energy windows
 
@@ -120,7 +169,7 @@ round_trip_margin_fraction = 0.1
 
 If `smoothing_width` or `minimum_width` is zero, the automatic choice is recorded as zero in the configuration metadata while the final continuous energy ranges are recorded explicitly. A pilot should be long enough for ordinary windows to complete several trips. Windows with no completed trip receive the maximum configured difficulty penalty. Adaptation is deterministic for a fixed master seed.
 
-The program writes per-window CSV files, a stitched DOS with a within-run standard error across walkers, thermodynamic observables, and JSON metadata including exchange and forced acceptance. The absolute output prefix is printed before sampling. The original 1D validity rule remains unchanged: only bins visited by every walker in the corresponding window contribute. A one-walker run reports `standard_error=nan`. This uncertainty describes dispersion inside one REWL run and does not replace an ensemble of independent master seeds. If a run stops with `converged=no`, it also writes `${output_prefix}_workers_stat.csv` with each walker's attempted flips and MCS, flip acceptance, forced-acceptance count, age of the last accepted flip in both units, final energy, modification factor, active-bin count, `min(H)/mean(H)`, and completed energy round trips. Metadata, worker statistics, and raw window fragments are written even when the walkers or neighboring windows have insufficient common support for a global DOS; metadata then records `postprocessing_status=insufficient_support` or `disconnected_support`. WLCHKP5 checkpoint/restart is supported only for a single MPI process, single window, and single walker; it validates the complete E/Q layout and order-parameter weights before a transactional restore. Legacy checkpoints are accepted only in 1D with reduced layout verification.
+The program writes per-window CSV files, a stitched DOS with a within-run standard error across walkers, thermodynamic observables, and JSON metadata including exchange and forced acceptance. The absolute output prefix is printed before sampling. The original 1D validity rule remains unchanged: only bins visited by every walker in the corresponding window contribute. A one-walker run reports `standard_error=nan`. This uncertainty describes dispersion inside one REWL run and does not replace an ensemble of independent master seeds. Every normally completed run writes `${output_prefix}_workers_stat.csv`, `${output_prefix}_workers_missing_bins.csv`, and `${output_prefix}_exchange_stat.csv`. These report each walker's stage and coverage, exact missing cells, time since refinement, initialization and return work, and exchange acceptance per window boundary. Metadata contains compact per-walker return and initialization totals. Initialization failures write rank-specific `${output_prefix}_failure_rank_N*` diagnostics. Metadata, diagnostics, and raw window fragments are written even when neighboring windows have insufficient common support for a global DOS; metadata then records `postprocessing_status=insufficient_support` or `disconnected_support`. WLCHKP5 checkpoint/restart is supported only for a single MPI process, single window, and single walker; it validates the complete E/Q layout and order-parameter weights before a transactional restore. Session timing and return counters reset after checkpoint restoration; production counters retain their checkpoint values.
 
 Use exact enumeration for small validation systems:
 
@@ -136,7 +185,7 @@ Stitch previously generated fragment CSV files with `wl_analyze`. Measure increm
 - Every walker owns `log_g`, `H`, its cumulative active mask, modification factor, and refinement stage. Walkers never copy or average DOS during sampling.
 - Unless an explicit in-window spin configuration is supplied through the C++ API, initialization uses an adaptive target Metropolis chain with `pi(E) proportional to exp(-abs(E-E_target)/T_search)`. `E_target` is the window center, the default accepted target band is the central 50% of the window, and the initial `T_search` is 5% of the window width (never below one energy-bin width). After `stall_attempts_per_spin*N` proposals without a closer energy, `T_search` is multiplied by `temperature_multiplier` up to `max_temperature_fraction` of the window width. Another stall at the maximum temperature reproducibly randomizes the spins and restarts at the initial temperature. The defaults are `1000`, `2`, and `0.5`, respectively. Configure these values in `[initialization]` or with the corresponding `--initialization-*` CLI options. Initialization proposals and restarts do not update WL counters; only the selected starting bin receives the initial `H` and `log_g` update.
 - Initial iterations use `ln(f)=1` and `ln(f) <- ln(f)/2`. With `inverse_time=true`, a walker advances after every bin in its cumulative discovered energy support has been visited at least once during the current stage; the configured flatness threshold is not used. A traditional `inverse_time=false` run retains the histogram-flatness and minimum-visit criteria. Walkers advance independently without waiting for the other walkers in the window.
-- Set `[wl] return_mode = true` or pass `--return-mode true` to restore every walker to a common reference configuration after each `ln(f) <- ln(f)/2` step. Without adaptive warm starts the reference is the all-`+1` state. When a warm-start bank is available, the lowest-energy configuration in that bank is used for every window, so the lower edge window returns directly to the best available ground-state candidate. Higher windows run the same adaptive target-Metropolis initialization from that reference until they re-enter their own energy range. This search does not increment production attempted/accepted counters or visit intermediate DOS cells; its final state seeds the new histogram once. The continuous `1/t` stage does not perform further returns because it no longer halves `ln(f)`.
+- Set `[wl] return_mode = true` or pass `--return-mode true` to restore walkers to a reference configuration after each `ln(f) <- ln(f)/2` step. `return_scope = all_windows` retains the original behavior; `return_scope = lowest_window` limits returns to the lower edge window and avoids repeated searches from the lowest-energy reference into upper windows. Without adaptive warm starts the reference is the initial all-`+1` state. With adaptive warm starts the lowest-energy stored configuration is used. Return searches do not increment production attempted/accepted counters or visit intermediate DOS cells, but their attempts, restarts, elapsed worker time, reference energy, and completed return count are recorded. A walker that enters `frozen` does not perform a final unnecessary return. The continuous `1/t` stage does not perform further returns because it no longer halves `ln(f)`.
 - Set `[wl] nalivaiko_mod = true` to reset a separate flatness/coverage active-bin mask whenever `ln(f)` is halved. The cumulative active mask used for final DOS validity and the `1/t` active-bin count is preserved. The default is `false`, which retains cumulative discovered-bin checks.
 - By default, each walker changes independently to `1/t` when `ln(f) <= 1/t`, with `t=attempted_flips/active_bins`; this internal counter is deliberately not converted to MCS. Set `[wl] inverse_time = false` or pass `--inverse-time false` to keep the traditional Wang–Landau schedule `ln(f) <- ln(f)/2` until `final_factor`. The active-bin count is cached and updated only on first visits and checkpoint restore, so a `1/t` flip remains `O(1)` apart from the coupling update.
 - After sampling, window DOS estimates are aligned at the first bin in the intersection of all walker active masks and averaged in log space. Bins outside that intersection are written as `valid=0` with `log_g=nan`; adjacent windows must share at least one valid overlap bin.

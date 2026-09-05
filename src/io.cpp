@@ -138,6 +138,7 @@ void apply_ini_setting(RunConfig& c,const std::string& section,const std::string
     else if(full=="wl.inverse_time") c.wl.inverse_time_enabled=boolean(value,full);
     else if(full=="wl.nalivaiko_mod") c.wl.nalivaiko_mod=boolean(value,full);
     else if(full=="wl.return_mode") c.wl.return_mode=boolean(value,full);
+    else if(full=="wl.return_scope") c.return_scope=value;
     else if(full=="wl.support_stability_checks")
         c.wl.support_stability_checks=number<std::size_t>(value,full);
     else if(full=="wl.check_interval") { c.wl.check_interval_attempts=number<std::uint64_t>(value,full); c.check_interval_uses_mcs=false; }
@@ -291,6 +292,8 @@ void RunConfig::validate(bool require_grid) const {
         dos_grid().validate();
     }
     if (windows > grid.bins()) throw std::invalid_argument("More windows than energy bins");
+    if(return_scope!="all_windows" && return_scope!="lowest_window")
+        throw std::invalid_argument("return_scope must be all_windows or lowest_window");
     if(!explicit_windows.empty()) {
         if(explicit_windows.size()!=windows || explicit_windows.front().begin!=0 ||
            explicit_windows.back().end!=grid.bins())
@@ -376,6 +379,7 @@ RunConfig parse_arguments(int argc, char** argv) {
         else if (key == "--check-interval") { c.wl.check_interval_attempts=number<std::uint64_t>(value(i,key),key); c.check_interval_uses_mcs=false; }
         else if (key == "--inverse-time") c.wl.inverse_time_enabled=boolean(value(i,key),key);
         else if (key == "--return-mode") c.wl.return_mode=boolean(value(i,key),key);
+        else if (key == "--return-scope") c.return_scope=value(i,key);
         else if (key == "--check-interval-mcs") { c.check_interval_mcs=number<double>(value(i,key),key); c.check_interval_uses_mcs=true; }
         else if (key == "--force-accept-after") { c.wl.force_accept_after_attempts=number<std::uint64_t>(value(i,key),key); c.force_accept_after_uses_mcs=false; }
         else if (key == "--force-accept-after-mcs") { c.force_accept_after_mcs=number<double>(value(i,key),key); c.force_accept_after_uses_mcs=true; }
@@ -428,6 +432,7 @@ std::string usage(std::string_view program) {
       "  [--adaptive-round-trip-target R --adaptive-round-trip-penalty P]\n"
       "  [--flatness 0.8 --min-visits 100 --final-factor 1e-8 --inverse-time true|false]\n"
       "  [--return-mode true|false] resets to the reference state after factor halving.\n"
+      "  [--return-scope all_windows|lowest_window] defaults to all_windows.\n"
       "  [--initialization-max-attempts N --initialization-target-fraction 0.5]\n"
       "  [--initialization-temperature-fraction 0.05]\n"
       "  [--initialization-stall-attempts-per-spin 1000]\n"
@@ -554,7 +559,10 @@ void write_workers_stat_csv(const std::string& path,
     if(spin_count==0) throw std::invalid_argument("Cannot write MCS statistics for zero spins");
     std::ofstream out(path); if (!out) throw std::runtime_error("Cannot write " + path);
     out << "mpi_rank,window,walker_id,attempted_flips,attempted_mcs,accepted,forced_accepted,accepted_percent,"
-           "attempts_since_last_accepted,mcs_since_last_accepted,energy,factor,active_bins,min_h,mean_h,min_over_mean,round_trips\n"
+           "attempts_since_last_accepted,mcs_since_last_accepted,energy,factor,active_bins,min_h,mean_h,min_over_mean,round_trips,"
+           "stage,covered_bins,coverage,cumulative_active_bins,cumulative_covered_bins,"
+           "mcs_since_last_iteration,seconds_since_last_iteration,initialization_attempts,"
+           "initialization_restarts,initialization_seconds,returns_enabled,return_reference_energy,return_count\n"
         << std::setprecision(17);
     for (const auto& walker : statistics) {
         const auto percent = walker.attempted == 0 ? 0.0 :
@@ -569,7 +577,13 @@ void write_workers_stat_csv(const std::string& path,
             << walker.energy << ','
             << walker.factor << ',' << walker.active_bins << ','
             << walker.minimum_histogram << ',' << walker.mean_histogram << ','
-            << walker.min_over_mean << ',' << walker.round_trips << '\n';
+            << walker.min_over_mean << ',' << walker.round_trips << ','
+            << stage_name(walker.stage) << ',' << walker.covered_bins << ',' << walker.coverage << ','
+            << walker.cumulative_active_bins << ',' << walker.cumulative_covered_bins << ','
+            << static_cast<double>(walker.attempts_since_last_iteration)/static_cast<double>(spin_count) << ','
+            << walker.seconds_since_last_iteration << ',' << walker.initialization_attempts << ','
+            << walker.initialization_restarts << ',' << walker.initialization_seconds << ','
+            << walker.returns_enabled << ',' << walker.return_reference_energy << ',' << walker.return_count << '\n';
     }
 }
 
@@ -580,7 +594,8 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
                          bool converged, int mpi_size, int omp_threads,
                          std::string_view postprocessing_status,
                          std::span<const DosFragment> fragments,
-                         std::size_t support_components) {
+                         std::size_t support_components,
+                         std::span<const WalkerStatistics> walkers) {
     std::map<std::uint32_t,std::size_t> valid_by_contributors;
     std::size_t fragment_valid_cells=0;
     for(const auto& fragment:fragments)
@@ -593,7 +608,7 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
             }
     std::ofstream out(path); if (!out) throw std::runtime_error("Cannot write " + path);
     out << std::setprecision(17)
-        << "{\n  \"format_version\": 7,\n  \"config_file\": \""<<json_escape(c.config_file)<<"\",\n"
+        << "{\n  \"format_version\": 8,\n  \"config_file\": \""<<json_escape(c.config_file)<<"\",\n"
         << "  \"geometry_file\": \""<<json_escape(c.geometry_file)<<"\",\n"
         << "  \"physics\": {\"model\": \"dipolar_ising\", "
         << "\"spins\": "<<couplings.size()<<", \"coupling_scale\": "<<c.coupling_scale<<", \"periodic\": "<<(c.periodic?"true":"false")
@@ -640,6 +655,7 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
                                 "histogram_flatness"))<<"\""
         << ", \"nalivaiko_mod\": "<<(c.wl.nalivaiko_mod?"true":"false")
         << ", \"return_mode\": "<<(c.wl.return_mode?"true":"false")
+        << ", \"return_scope\": \""<<json_escape(c.return_scope)<<"\""
         << ", \"return_reference\": \"lowest_energy_supplied_warm_start_or_all_spins_plus_one\""
         << ", \"return_search_updates_production_attempts\": false"
         << ", \"refinement_active_scope\": \""
@@ -701,7 +717,24 @@ void write_metadata_json(const std::string& path, const RunConfig& c, const Coup
         << ",\n  \"forced_accepted\": "<<forced_accepted
         << ",\n  \"exchange_attempted\": "<<exchange_attempted
         << ",\n  \"exchange_accepted\": "<<exchange_accepted
-        << ",\n  \"converged\": "<<(converged?"true":"false")<<"\n}\n";
+        << ",\n  \"converged\": "<<(converged?"true":"false")
+        << ",\n  \"diagnostics_scope\": \"session_since_start_or_checkpoint_restore\""
+        << ",\n  \"walker_diagnostics\": [";
+    for(std::size_t i=0;i<walkers.size();++i) {
+        const auto& w=walkers[i];
+        if(i) out << ',';
+        out << "\n    {\"walker_id\": "<<w.walker_id<<", \"window\": "<<w.window_id
+            <<", \"mpi_rank\": "<<w.mpi_rank<<", \"stage\": \""<<stage_name(w.stage)<<"\""
+            <<", \"returns_enabled\": "<<(w.returns_enabled?"true":"false")
+            <<", \"return_reference_energy\": ";
+        if(w.returns_enabled && std::isfinite(w.return_reference_energy)) out << w.return_reference_energy;
+        else out << "null";
+        out <<", \"return_count\": "<<w.return_count
+            <<", \"initialization_attempts\": "<<w.initialization_attempts
+            <<", \"initialization_restarts\": "<<w.initialization_restarts
+            <<", \"initialization_seconds\": "<<w.initialization_seconds<<'}';
+    }
+    out << "\n  ]\n}\n";
 }
 
 void save_checkpoint(const std::string& path, const WalkerSnapshot& s) {
